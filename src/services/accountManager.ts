@@ -67,9 +67,26 @@ function stripJsoncComments(text: string): string {
 
 interface PersistedAccountData {
   email: string;
+  password?: string;
+  token?: string;
+  refreshToken?: string | null;
+  refresh_token?: string | null;
+  expiresAt?: number;
+  expires_at?: number;
+  cookies?: string;
+  profileCookies?: string;
+  throttledUntil?: number;
+  disabled?: boolean;
+}
+export interface LoadedAccountData {
+  email: string;
   password: string;
   throttledUntil?: number;
   disabled?: boolean;
+  token?: string;
+  refreshToken?: string | null;
+  expiresAt?: number;
+  profileCookies?: string;
 }
 export function parseAccountsFromEnv(): Array<{ email: string; password: string }> {
   const result: Array<{ email: string; password: string }> = [];
@@ -196,28 +213,48 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
     mkdirSync(dir, { recursive: true });
   }
   const data: PersistedAccountData[] = accounts
-    .filter((a) => a.password)
+    .filter((a) => a.password || a.state?.token)
     .map((a) => ({
       email: a.email,
-      password: a.password, // plaintext
+      ...(a.password ? { password: a.password } : {}),
+      ...(a.state?.token
+        ? {
+            token: a.state.token,
+            refreshToken: a.state.refreshToken,
+            expiresAt: a.state.expiresAt,
+          }
+        : {}),
+      ...(a.profileCookies ? { profileCookies: a.profileCookies } : {}),
       ...(a.throttledUntil > Date.now() ? { throttledUntil: a.throttledUntil } : {}),
       ...(a.disabled !== undefined ? { disabled: a.disabled } : {}),
     }));
   writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2), 'utf-8');
 }
-export function loadAccountsFromFile(): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean }> {
-  const tryLoad = (filePath: string): Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean }> | null => {
+function tokenExpiresAt(account: PersistedAccountData): number | undefined {
+  if (typeof account.expiresAt === 'number') return account.expiresAt;
+  if (typeof account.expires_at === 'number') return account.expires_at;
+  if (!account.token) return undefined;
+  const payload = decodeJwt(account.token);
+  if (typeof payload?.exp === 'number') return payload.exp * 1000;
+  return Date.now() + config.getInt('AUTH_TOKEN_MAX_AGE_MS', 28800000);
+}
+export function loadAccountsFromFile(): LoadedAccountData[] {
+  const tryLoad = (filePath: string): LoadedAccountData[] | null => {
     try {
       if (!existsSync(filePath)) return null;
       const raw = readFileSync(filePath, 'utf-8');
       const data: PersistedAccountData[] = JSON.parse(stripJsoncComments(raw));
       return data
-        .filter((d) => d.email && d.password)
+        .filter((d) => d.email && (d.password || d.token))
         .map((d) => ({
           email: d.email,
-          password: decryptPassword(d.password),
+          password: d.password ? decryptPassword(d.password) : '',
           throttledUntil: d.throttledUntil,
           disabled: d.disabled ?? false,
+          token: d.token,
+          refreshToken: d.refreshToken ?? d.refresh_token ?? null,
+          expiresAt: tokenExpiresAt(d),
+          profileCookies: d.profileCookies || d.cookies,
         }));
     } catch (err: any) {
       logStore.log('error', 'auth', `Failed to load ${filePath}: ${err.message}`);

@@ -125,11 +125,7 @@ app.get('/health', (c) => {
   });
 });
 // Ping — lightweight static response
-const PING_RESPONSE = new Response('OK', {
-  status: 200,
-  headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-cache' },
-});
-app.get('/ping', () => PING_RESPONSE);
+app.get('/ping', (c) => c.text('OK', 200, { 'Cache-Control': 'no-cache' }));
 
 // API Key protection for OpenAI-compatible routes
 app.use('/v1/*', async (c, next) => {

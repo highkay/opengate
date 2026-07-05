@@ -58,7 +58,7 @@ export interface BuildQwenMessagesResult {
 
 export function buildQwenMessages(messages: any[], body: any, availableTokens: number, _toolCalling: boolean): BuildQwenMessagesResult {
   const timestamp = Math.floor(Date.now() / 1000);
-  const model = (body.model || '').replace('-no-thinking', '');
+  const model = modelRouter.resolveAlias(body.model || '').replace('-no-thinking', '');
 
   const segments: string[] = [];
   const systemParts: string[] = [];
@@ -230,7 +230,8 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 export function handleImageModelFallback(body: any, messages: any[]): void {
   const hasImages = messages.some((m) => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url'));
   if (hasImages) {
-    const modelId = (body.model as string)
+    const modelId = modelRouter
+      .resolveAlias(body.model as string)
       .toLowerCase()
       .replace(/\./g, '-')
       .replace(/-no-thinking$/, '');
@@ -244,7 +245,8 @@ export function handleImageModelFallback(body: any, messages: any[]): void {
 }
 
 export function getModelSpecs(body: any): { maxContext: number; maxOutput: number } {
-  const modelId = (body.model as string)
+  const modelId = modelRouter
+    .resolveAlias(body.model as string)
     .toLowerCase()
     .replace(/\./g, '-')
     .replace(/-no-thinking$/, '');

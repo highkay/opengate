@@ -15,6 +15,7 @@ import {
   discoverSavedAccounts,
   enableHotReload as enableHotReloadImpl,
   getAccountByEmail,
+  type LoadedAccountData,
   loadAccountsFromFile,
   migrateFromOldPaths,
   rebuildEmailIndex,
@@ -83,10 +84,8 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   const persisted = loadAccountsFromFile();
   const discovered = discoverSavedAccounts();
 
-  // Merge persisted accounts (which may include throttledUntil and profileCookies) with discovered accounts
-  const merged: Array<{ email: string; password: string; throttledUntil?: number; disabled?: boolean; profileCookies?: string }> = [
-    ...discovered,
-  ];
+  // Merge persisted accounts (including legacy token-only qwen2api entries) with env-discovered accounts.
+  const merged: LoadedAccountData[] = discovered.map((a) => ({ ...a }));
   for (const p of persisted) {
     const existing = merged.find((a) => a.email.toLowerCase().trim() === p.email.toLowerCase().trim());
     if (existing) {
@@ -100,7 +99,15 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       if (p.disabled !== undefined) {
         existing.disabled = p.disabled;
       }
-    } else if (p.password) {
+      if (p.token) {
+        existing.token = p.token;
+        existing.refreshToken = p.refreshToken ?? existing.refreshToken ?? null;
+        existing.expiresAt = p.expiresAt;
+      }
+      if (p.profileCookies && !existing.profileCookies) {
+        existing.profileCookies = p.profileCookies;
+      }
+    } else if (p.password || p.token) {
       merged.push(p);
     }
   }
@@ -119,10 +126,17 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   for (const a of merged) {
     // Reset throttledUntil to 0 if it's in the past
     const persistedUntil = (a as any).throttledUntil || 0;
+    const hasUsablePersistedToken = Boolean(a.token && (!a.expiresAt || a.expiresAt > Date.now()));
     accounts.push({
       email: a.email,
       password: a.password,
-      state: null,
+      state: hasUsablePersistedToken
+        ? {
+            token: a.token!,
+            expiresAt: a.expiresAt || Date.now() + getAuthTokenMaxAgeMs(),
+            refreshToken: a.refreshToken || null,
+          }
+        : null,
       lastUsed: 0,
       throttledUntil: persistedUntil > Date.now() ? persistedUntil : 0,
       refreshInFlight: null,

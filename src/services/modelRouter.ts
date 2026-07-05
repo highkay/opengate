@@ -7,6 +7,36 @@
 import modelsConfig from '../models.json' with { type: 'json' };
 import { logStore } from './logStore.ts';
 
+export const COMPAT_MODEL_ALIASES: Record<string, string> = {
+  'claude-3-haiku': 'qwen3.5-flash',
+  'deepseek-chat': 'qwen3.6-plus',
+  'gpt-4.1': 'qwen3.6-plus',
+  'gpt-4.1-mini': 'qwen3.5-flash',
+  o3: 'qwen3.6-plus',
+  'o3-mini': 'qwen3.5-flash',
+  'claude-sonnet-4-5': 'qwen3.6-plus',
+  'claude-3-sonnet': 'qwen3.6-plus',
+  'gpt-4o': 'qwen3.6-plus',
+  'gpt-4': 'qwen3.6-plus',
+  'gpt-3.5-turbo': 'qwen3.5-flash',
+  o1: 'qwen3.6-plus',
+  'claude-3.5-sonnet': 'qwen3.6-plus',
+  'gemini-2.5-pro': 'qwen3.6-plus',
+  'qwen-max': 'qwen3.6-plus',
+  'qwen-turbo': 'qwen3.5-flash',
+  'gpt-4-turbo': 'qwen3.6-plus',
+  'o1-mini': 'qwen3.5-flash',
+  'claude-3-opus': 'qwen3.6-plus',
+  'gemini-2.5-flash': 'qwen3.5-flash',
+  qwen: 'qwen3.6-plus',
+  'qwen-plus': 'qwen3.6-plus',
+  'deepseek-reasoner': 'qwen3.6-plus',
+  'gpt-4o-mini': 'qwen3.5-flash',
+  'gpt-5': 'qwen3.6-plus',
+  'claude-opus-4-6': 'qwen3.6-plus',
+  'qwen3-coder': 'qwen3-coder-plus',
+};
+
 export interface FallbackEntry {
   model: string;
   weight: number;
@@ -30,16 +60,24 @@ export class ModelRouter {
   private readonly ERROR_THRESHOLD = 0.3; // 30% error rate triggers degradation
   private readonly HEALTH_WINDOW_MS = 5 * 60 * 1000; // 5 minute sliding window
 
+  resolveAlias(requestedModel: string): string {
+    const suffix = requestedModel.endsWith('-no-thinking') ? '-no-thinking' : '';
+    const base = suffix ? requestedModel.slice(0, -suffix.length) : requestedModel;
+    const target = COMPAT_MODEL_ALIASES[base.toLowerCase()] || base;
+    return target + suffix;
+  }
+
   /**
    * Route a requested model alias to an available model based on health
    * Falls back through weighted chain if primary is unhealthy or fails
    */
   async route(requestedModel: string, attemptCount = 0): Promise<string> {
-    const config = modelsConfig[requestedModel as keyof typeof modelsConfig] as ModelConfig | undefined;
+    const resolvedModel = this.resolveAlias(requestedModel);
+    const config = modelsConfig[resolvedModel as keyof typeof modelsConfig] as ModelConfig | undefined;
 
     if (!config?.fallback_chain) {
       // No fallback config, return as-is
-      return requestedModel;
+      return resolvedModel;
     }
 
     const { primary, fallbacks } = config.fallback_chain;

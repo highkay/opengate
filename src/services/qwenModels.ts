@@ -3,6 +3,7 @@ import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { DEFAULT_SYSTEM_PROMPT } from './defaultSystemPrompt.ts';
 import { logStore } from './logStore.ts';
+import { COMPAT_MODEL_ALIASES } from './modelRouter.ts';
 import { completeEntry, errorEntry } from './networkDebug.ts';
 import { getBasicHeaders } from './playwright.ts';
 import { QWEN_API_BASE, QWEN_CHATS_URL, QWEN_MODELS_URL, QWEN_SETTINGS_URL } from './qwen.ts';
@@ -208,6 +209,26 @@ export async function fetchQwenModels(): Promise<any[]> {
         description: m.info?.meta?.short_description || m.info?.meta?.description || '',
         capabilities: m.info?.meta?.capabilities || {},
       }));
+      const byId = new Map(models.map((m: any) => [m.id, m]));
+      for (const [alias, target] of Object.entries(COMPAT_MODEL_ALIASES)) {
+        if (byId.has(alias)) continue;
+        const base = byId.get(target) || {
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'qwen',
+          context_window: 250000,
+          max_output_tokens: 65000,
+          modalities: ['text'],
+          description: '',
+          capabilities: {},
+        };
+        models.push({
+          ...base,
+          id: alias,
+          owned_by: 'qwen2api-compat',
+          base_model: target,
+        });
+      }
 
       cachedModels = models;
       lastModelsFetch = now;
