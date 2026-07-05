@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import { bearerAuth } from 'hono/bearer-auth';
 import { resolve } from 'path';
 import { getAccountCount, getAccountStats, getAllAccountEmails, getAvailableCount, initAuth } from '../../services/auth.ts';
-import { config, isValidKey } from '../../services/configService.ts';
+import { config, isValidKey, updateClaudeCodeSettings } from '../../services/configService.ts';
 import { logStore } from '../../services/logStore.ts';
 import { monitorStore } from '../../services/monitorStore.ts';
 
@@ -372,9 +372,7 @@ export function registerDashboardRoutes(app: Hono): void {
     '/api/config',
     async (c, next) => requireApiKey(c, next),
     (c) => {
-      const all = config.getAll();
-      const safe = Object.fromEntries(Object.entries(all).filter(([k]) => !['API_KEY'].includes(k)));
-      return c.json({ config: safe });
+      return c.json({ config: config.getAll() });
     },
   );
 
@@ -391,10 +389,11 @@ export function registerDashboardRoutes(app: Hono): void {
             changed = true;
           }
         }
-        if (changed) config.save();
-        const all = config.getAll();
-        const safe = Object.fromEntries(Object.entries(all).filter(([k]) => !['API_KEY'].includes(k)));
-        return c.json({ config: safe });
+        if (changed) {
+          config.save();
+          updateClaudeCodeSettings(config.getAll());
+        }
+        return c.json({ config: config.getAll() });
       } catch {
         return c.json({ error: 'invalid request body' }, 400);
       }

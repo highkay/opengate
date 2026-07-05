@@ -281,7 +281,7 @@ function updateRestartBadge(key) {
 /* ── Load ── */
 async function loadSettings() {
   try {
-    var res = await fetch('/api/config');
+    var res = await fetch('/api/config', { headers: authHeaders() });
     if (res.ok) {
       var data = await res.json();
       if (data && data.config) {
@@ -319,7 +319,7 @@ async function saveSettings() {
   btn.textContent = 'Saving...';
   var msgEl = document.getElementById('settingsMessage');
   try {
-    var headers = { 'Content-Type': 'application/json' };
+    var headers = Object.assign({ 'Content-Type': 'application/json' }, authHeaders());
     var res = await fetch('/api/config', {
       method: 'PUT',
       headers: headers,
@@ -329,6 +329,9 @@ async function saveSettings() {
     if (!res.ok) {
       msgEl.innerHTML = '<div class="settings-message error">' + escHtml(result.error || 'Save failed (' + res.status + ')') + '</div>';
     } else {
+      if (Object.prototype.hasOwnProperty.call(settingsData, 'API_KEY')) {
+        window.API_KEY = settingsData.API_KEY || '';
+      }
       if (result.config) {
         var keys = Object.keys(result.config);
         for (var i = 0; i < keys.length; i++) {

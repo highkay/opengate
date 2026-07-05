@@ -56,7 +56,7 @@ export interface BuildQwenMessagesResult {
 
 // ── Business logic ───────────────────────────────────────────────
 
-export function buildQwenMessages(messages: any[], body: any, availableTokens: number, _toolCalling: boolean): BuildQwenMessagesResult {
+export function buildQwenMessages(messages: any[], body: any, availableTokens: number, toolCalling: boolean): BuildQwenMessagesResult {
   const timestamp = Math.floor(Date.now() / 1000);
   const model = modelRouter.resolveAlias(body.model || '').replace('-no-thinking', '');
 
@@ -168,7 +168,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const featureConfig = buildFeatureConfig(true);
 
-  if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+  if (toolCalling && body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
     const toolNames: string[] = [];
