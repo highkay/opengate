@@ -36,7 +36,7 @@ COPY --from=build /app/package.json ./
 RUN addgroup -g 1001 -S qwen && \
     adduser -S qwen -u 1001 -G qwen && \
     mkdir -p /app/.qwen /app/logs && \
-    chown -R qwen:qwen /app
+    chown -R qwen:qwen /app/.qwen /app/logs
 USER qwen
 
 ENV PORT=26405
