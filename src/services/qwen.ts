@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
+import { CircuitBreaker, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
 import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
@@ -401,12 +401,11 @@ export async function createQwenStream(
   };
 
   let result: { response: Response; headers: Record<string, string>; qwenLogFile?: string };
-  const cbState = qwenCircuitBreaker.getState();
-  if (cbState === 'open') {
-    const stats = qwenCircuitBreaker.getStats();
-    const retryAfterMs = Math.max(0, 30_000 - (Date.now() - stats.lastFailureTime));
-    throw new CircuitOpenError(retryAfterMs);
-  }
+  // IMPORTANT: use allowRequest() (not getState()). getState() never transitions
+  // open → half_open, so once the breaker trips the process stays dead forever
+  // until restart. allowRequest() calls tryTransitionToHalfOpen() first.
+  // withRetry also calls allowRequest(); the double-check is intentional and safe.
+  qwenCircuitBreaker.allowRequest();
   if (retriesEnabled && retryConfig.maxRetries > 0) {
     result = await withRetry(makeRequest, { ...retryConfig, circuitBreaker: qwenCircuitBreaker });
   } else {
