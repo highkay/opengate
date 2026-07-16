@@ -6,7 +6,7 @@ import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
-import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
+import { uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { OpenAIRequest } from '../types/openai.ts';
@@ -88,10 +88,12 @@ async function parseRequestBody(c: Context) {
 }
 
 async function setupSession(messages: any[], body: OpenAIRequest, availableTokens: number, toolCalling: boolean, logId: string) {
-  // ── Image detection ──────────────────────────────────────────
-  // Only scan the LAST message — previous turns already uploaded their images
+  // ── Image / video detection ──────────────────────────────────
+  // Only scan the LAST message — previous turns already uploaded their media
   let hasImages = false;
+  let hasVideos = false;
   const imageUrls: string[] = [];
+  const videoUrls: string[] = [];
 
   const lastMsg = messages[messages.length - 1];
   if (lastMsg && Array.isArray(lastMsg.content)) {
@@ -99,19 +101,25 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       if (part?.type === 'image_url' && part?.image_url?.url) {
         hasImages = true;
         imageUrls.push(part.image_url.url);
+      } else if (part?.type === 'video_url' && part?.video_url?.url) {
+        hasVideos = true;
+        videoUrls.push(part.video_url.url);
       }
     }
   }
 
-  // Strip image_url parts only from the last message
+  // Strip image_url / video_url parts only from the last message
   // (older messages shouldn't have them, but handle for safety)
   let cleanedMessages = messages;
-  if (hasImages) {
+  if (hasImages || hasVideos) {
     cleanedMessages = messages.map((msg: any, idx: number) => {
       if (idx !== messages.length - 1) return msg; // only strip last message
       if (!Array.isArray(msg.content)) return msg;
-      const textParts = msg.content.filter((c: any) => c.type !== 'image_url');
-      return { ...msg, content: textParts.length > 0 ? textParts : [{ type: 'text', text: '[Image]' }] };
+      const textParts = msg.content.filter((c: any) => c.type !== 'image_url' && c.type !== 'video_url');
+      let placeholder = '[Image]';
+      if (hasVideos && hasImages) placeholder = '[Media]';
+      else if (hasVideos) placeholder = '[Video]';
+      return { ...msg, content: textParts.length > 0 ? textParts : [{ type: 'text', text: placeholder }] };
     });
   }
 
@@ -170,7 +178,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       throw lastError || new Error('All accounts are rate-limited. Please wait and try again later.');
     }
 
-    // Upload images with concurrency limit — impers worker handles concurrency
+    // Upload images/videos with concurrency limit — impers worker handles concurrency
     let imageFiles: QwenFileAttachment[] = [];
     if (hasImages && accountEmail) {
       const MAX_CONCURRENT = 2;
@@ -191,6 +199,22 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       }
     }
 
+    let videoFiles: QwenFileAttachment[] = [];
+    if (hasVideos && accountEmail) {
+      // Videos are larger — upload sequentially to avoid memory spikes
+      for (const url of videoUrls) {
+        try {
+          const file = await uploadVideoAsFile(accountEmail, url);
+          videoFiles.push(file);
+        } catch (err: any) {
+          logStore.log('warn', 'chat', `[Chat] Video upload failed: ${err.message}`);
+        }
+      }
+      if (videoFiles.length === 0) {
+        throw new Error('Failed to upload videos — none of the video files could be uploaded');
+      }
+    }
+
     // Upload a single context file: system instructions + tool results + older chat history
     // Merging cuts upload overhead in half (one STS token, one OSS upload, one parse poll)
     if (accountEmail && (systemContent || toolResultsContent || chatHistoryContent)) {
@@ -207,11 +231,12 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       }
     }
 
-    // Attach uploaded images to the first message
-    if (imageFiles.length > 0) {
+    // Attach uploaded media to the first message
+    const mediaFiles = [...imageFiles, ...videoFiles];
+    if (mediaFiles.length > 0) {
       processedMessages[0] = {
         ...processedMessages[0],
-        files: [...(processedMessages[0].files || []), ...imageFiles],
+        files: [...(processedMessages[0].files || []), ...mediaFiles],
       };
     }
 

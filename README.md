@@ -36,6 +36,7 @@ Then open [http://localhost:26405/dashboard](http://localhost:26405/dashboard) t
 - **Web Dashboard** — Real-time monitoring with 5 pages: overview, request log, account manager, network debug, and settings.
 - **Dual Transport** — Pure Node.js fetch via wreq-js for requests, Playwright browser automation for login/auth only. No browser needed for API calls.
 - **File Upload** — Large context payloads auto-uploaded as Qwen file attachments. Context above limit goes to `context.txt`, latest user message stays inline for low latency.
+- **Multimodal Media** — Images (`image_url`, max 10MB) and videos (`video_url`, max 100MB) are downloaded and uploaded to Qwen's file system automatically. Models without vision/video modalities auto-fallback to `qwen3.7-plus`.
 - **No Build Step** — TypeScript executed directly via Bun. Run from source with no compilation needed.
 - **Bun-Powered** — Native TypeScript execution, built-in test runner, and cluster mode for multi-core utilization.
 

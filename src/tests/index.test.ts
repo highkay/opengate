@@ -425,6 +425,139 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
   }
 });
 
+test('Chat completions with video uploads attaches files (t2t chat_type, video class)', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'test-video@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready',
+  });
+
+  let stsCalled = false;
+  let stsFiletype: string | null = null;
+  let ossCalled = false;
+  let chatPayload: any = null;
+
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      stsCalled = true;
+      try {
+        const bodyStr = typeof init?.body === 'string' ? init.body : '';
+        const body = bodyStr ? JSON.parse(bodyStr) : {};
+        stsFiletype = body.filetype ?? null;
+      } catch {}
+      return new Response(
+        JSON.stringify({
+          data: {
+            access_key_id: 'test-key',
+            access_key_secret: 'test-secret',
+            security_token: 'test-token',
+            bucketname: 'test-bucket',
+            region: 'oss-cn-hangzhou',
+            endpoint: 'oss-cn-hangzhou.aliyuncs.com',
+            file_id: 'test-video-file-id',
+            file_path: 'test-user/test-video-file-id_video.mp4',
+            file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-video-file-id_video.mp4',
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      // Videos should NOT trigger parse — fail loudly if they do
+      throw new Error('parse should not be called for video uploads');
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      ossCalled = true;
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const bodyStr =
+        typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
+      try {
+        chatPayload = JSON.parse(bodyStr);
+      } catch {}
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices": [{"delta": {"content": "Video received"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    // Minimal valid base64 payload (not a real mp4 — upload path only checks size/mime)
+    const payload = {
+      model: 'qwen3.6-plus',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'What happens in this video?' },
+            { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+          ],
+        },
+      ],
+      stream: false,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer test-key-for-testing' }),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    assert.ok(stsCalled, 'Should have called getstsToken for video upload');
+    assert.strictEqual(stsFiletype, 'video', 'STS filetype should be video');
+    assert.ok(ossCalled, 'Should have uploaded video to OSS');
+
+    assert.ok(chatPayload, 'Chat completion should have been called');
+    const msg = chatPayload?.messages?.[0];
+    assert.ok(msg, 'Should have at least one message');
+
+    assert.ok(!msg.content.includes('video_url'), 'Video URL should be stripped from content text');
+    assert.ok(msg.content.includes('What happens in this video?'), 'Text content should be preserved');
+
+    assert.ok(Array.isArray(msg.files), 'Message should have files array');
+    assert.ok(msg.files.length > 0, 'Should have at least one file (video)');
+
+    assert.strictEqual(msg.chat_type, 't2t', 'Chat type should remain t2t for videos');
+    assert.strictEqual(msg.sub_chat_type, 't2t', 'Sub chat type should remain t2t');
+
+    const file = msg.files[0];
+    assert.strictEqual(file.type, 'video', 'File attachment type should be video');
+    assert.strictEqual(file.file_class, 'video', 'File class should be video');
+    assert.strictEqual(file.showType, 'video', 'showType should be video');
+    assert.strictEqual(file.file_type, 'video/mp4', 'file_type should be video/mp4');
+  } finally {
+    globalThis.fetch = originalFetch;
+    accounts.splice(0, accounts.length, ...originalAccounts);
+  }
+});
+
 test('Chat Completions endpoint - Non-streaming (stream: false)', async () => {
   const originalFetch = globalThis.fetch;
   (globalThis as any).fetch = async (input: any) => {

@@ -414,3 +414,74 @@ export async function uploadImageAsFile(email: string, imageUrl: string): Promis
 
   return uploadFileContent(email, buffer, fileName, mimeType, 'vision', 'image', 'image', 'image');
 }
+
+/**
+ * Download a video (data URI or remote URL) and upload it to Qwen's file system.
+ * Returns a QwenFileAttachment ready to attach to messages.
+ *
+ * Format mirrors image uploads (aligned with Qwen web UI multimodal attachments):
+ * - STS filetype = 'video'
+ * - attachment type / showType = 'video'
+ * - file_class = 'video'
+ * - no server-side parse step (Qwen processes media directly from OSS)
+ */
+export async function uploadVideoAsFile(email: string, videoUrl: string): Promise<QwenFileAttachment> {
+  let buffer: Buffer;
+  let mimeType: string;
+  let fileName: string;
+
+  if (videoUrl.startsWith('data:')) {
+    // Data URI: data:video/mp4;base64,...
+    const match = videoUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) throw new Error('Invalid data URI format');
+    mimeType = match[1];
+    if (!mimeType.startsWith('video/')) {
+      throw new Error(`Not a video data URI: ${mimeType}`);
+    }
+    buffer = Buffer.from(match[2], 'base64');
+    fileName = `video.${mimeType.split('/')[1]?.split('+')[0] || 'mp4'}`;
+  } else {
+    // Remote URL — longer timeout than images (videos are larger)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
+    try {
+      const response = await fetch(videoUrl, { signal: controller.signal });
+      if (!response.ok) throw new Error(`Failed to download video: ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      // Accept pure video/* or content-type with parameters (e.g. video/mp4; codecs=...)
+      const baseType = contentType.split(';')[0].trim().toLowerCase();
+      if (!baseType.startsWith('video/')) {
+        // Some CDNs omit content-type; fall back to extension sniffing
+        const ext = videoUrl.split('?')[0].split('.').pop()?.toLowerCase() || '';
+        const extMime: Record<string, string> = {
+          mp4: 'video/mp4',
+          webm: 'video/webm',
+          mov: 'video/quicktime',
+          mkv: 'video/x-matroska',
+          avi: 'video/x-msvideo',
+          mpeg: 'video/mpeg',
+          mpg: 'video/mpeg',
+        };
+        if (!extMime[ext]) {
+          throw new Error(`Not a video: ${contentType || 'unknown content-type'}`);
+        }
+        mimeType = extMime[ext];
+      } else {
+        mimeType = baseType;
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      buffer = Buffer.from(arrayBuffer);
+      fileName = `video.${mimeType.split('/')[1]?.split('+')[0] || 'mp4'}`;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  // Reject videos over 100MB (Qwen multimodal video limit)
+  if (buffer.length > 100 * 1024 * 1024) {
+    throw new Error(`Video too large: ${(buffer.length / 1024 / 1024).toFixed(1)}MB (max 100MB)`);
+  }
+
+  // Videos, like images, are multimodal media — skip document parse pipeline
+  return uploadFileContent(email, buffer, fileName, mimeType, 'video', 'video', 'video', 'video');
+}

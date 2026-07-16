@@ -163,6 +163,68 @@ data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890
 }
 ```
 
+#### Multimodal: Images
+
+Image parts use OpenAI's `image_url` content type. The gateway downloads the image (data URI or remote URL), uploads it to Qwen's file system via STS/OSS, and attaches it to the chat message. Max size: **10MB**.
+
+```bash
+curl http://localhost:26405/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "qwen3.7-plus",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is in this image?"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}}
+      ]
+    }],
+    "stream": true
+  }'
+```
+
+Data URI is also supported:
+
+```json
+{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+```
+
+#### Multimodal: Videos
+
+Video parts use DashScope / OpenAI-compatible `video_url` content type. The gateway downloads the video, uploads it to Qwen's file system, and attaches it as a multimodal file. Max size: **100MB**. Supported sources: data URI or remote URL (`video/mp4`, `video/webm`, `video/quicktime`, etc.).
+
+Only models that advertise `video` in `modalities` (e.g. `qwen3-6-plus`, `qwen3-7-plus`, `qwen3-5-flash`) can process videos. If the selected model does not support video, the gateway auto-falls back to `qwen3.7-plus`.
+
+```bash
+curl http://localhost:26405/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{
+    "model": "qwen3.7-plus",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Summarize this video."},
+        {"type": "video_url", "video_url": {"url": "https://example.com/clip.mp4"}}
+      ]
+    }],
+    "stream": true
+  }'
+```
+
+Data URI:
+
+```json
+{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA..."}}
+```
+
+Notes:
+
+- Only media in the **last** user message is uploaded (prior turns are already in the session).
+- Images upload with concurrency 2; videos upload sequentially.
+- Chat type stays `t2t` (same as Qwen web UI for multimodal chat).
+
 #### Tool Calling Example
 
 **Request:**

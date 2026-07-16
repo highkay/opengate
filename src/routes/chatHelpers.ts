@@ -227,20 +227,35 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   return { qwenMessages, systemContent, toolResultsContent };
 }
 
+/**
+ * If the request contains images and/or videos, ensure the selected model
+ * advertises the required modalities. Falls back to qwen3.7-plus (supports
+ * text + image + video) when the chosen model does not.
+ */
 export function handleImageModelFallback(body: any, messages: any[]): void {
-  const hasImages = messages.some((m) => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url'));
-  if (hasImages) {
-    const modelId = modelRouter
-      .resolveAlias(body.model as string)
-      .toLowerCase()
-      .replace(/\./g, '-')
-      .replace(/-no-thinking$/, '');
-    const specs = (modelSpecs as Record<string, ModelSpec>)[modelId];
-    const supportsImages = specs?.modalities.includes('image');
-    if (!supportsImages) {
-      const original = body.model;
-      body.model = 'qwen3.7-plus' + (original.includes('-no-thinking') ? '-no-thinking' : '');
+  let needsImage = false;
+  let needsVideo = false;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const c of m.content) {
+      if (c?.type === 'image_url') needsImage = true;
+      if (c?.type === 'video_url') needsVideo = true;
     }
+  }
+  if (!needsImage && !needsVideo) return;
+
+  const modelId = modelRouter
+    .resolveAlias(body.model as string)
+    .toLowerCase()
+    .replace(/\./g, '-')
+    .replace(/-no-thinking$/, '');
+  const specs = (modelSpecs as Record<string, ModelSpec>)[modelId];
+  const modalities = specs?.modalities ?? [];
+  const missingImage = needsImage && !modalities.includes('image');
+  const missingVideo = needsVideo && !modalities.includes('video');
+  if (missingImage || missingVideo) {
+    const original = body.model;
+    body.model = 'qwen3.7-plus' + (original.includes('-no-thinking') ? '-no-thinking' : '');
   }
 }
 

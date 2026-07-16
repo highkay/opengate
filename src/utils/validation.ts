@@ -15,6 +15,13 @@ const contentPartSchema = z.object({
       detail: z.string().optional(),
     })
     .optional(),
+  // OpenAI / DashScope-compatible video part (Aliyun Bailian uses type: "video_url")
+  video_url: z
+    .object({
+      url: z.string(),
+      detail: z.string().optional(),
+    })
+    .optional(),
 });
 
 const messageSchema = z.object({

@@ -7,7 +7,7 @@ import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
-import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
+import { uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import type { OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
@@ -287,23 +287,31 @@ async function setupAnthropicSession(
   qwenAbortController: AbortController;
 }> {
   let hasImages = false;
+  let hasVideos = false;
   const imageUrls: string[] = [];
+  const videoUrls: string[] = [];
   const lastMsg = messages[messages.length - 1];
   if (lastMsg && Array.isArray(lastMsg.content)) {
     for (const part of lastMsg.content) {
       if (part?.type === 'image_url' && part?.image_url?.url) {
         hasImages = true;
         imageUrls.push(part.image_url.url);
+      } else if (part?.type === 'video_url' && part?.video_url?.url) {
+        hasVideos = true;
+        videoUrls.push(part.video_url.url);
       }
     }
   }
   let cleanedMessages = messages;
-  if (hasImages) {
+  if (hasImages || hasVideos) {
     cleanedMessages = messages.map((msg: any, idx: number) => {
       if (idx !== messages.length - 1) return msg;
       if (!Array.isArray(msg.content)) return msg;
-      const textParts = msg.content.filter((c: any) => c.type !== 'image_url');
-      return { ...msg, content: textParts.length > 0 ? textParts : [{ type: 'text', text: '[Image]' }] };
+      const textParts = msg.content.filter((c: any) => c.type !== 'image_url' && c.type !== 'video_url');
+      let placeholder = '[Image]';
+      if (hasVideos && hasImages) placeholder = '[Media]';
+      else if (hasVideos) placeholder = '[Video]';
+      return { ...msg, content: textParts.length > 0 ? textParts : [{ type: 'text', text: placeholder }] };
     });
   }
 
@@ -375,6 +383,21 @@ async function setupAnthropicSession(
       }
     }
 
+    let videoFiles: QwenFileAttachment[] = [];
+    if (hasVideos && accountEmail) {
+      for (const url of videoUrls) {
+        try {
+          const file = await uploadVideoAsFile(accountEmail, url);
+          videoFiles.push(file);
+        } catch (err: any) {
+          logStore.log('warn', 'chat', `[Anthropic] Video upload failed: ${err.message}`);
+        }
+      }
+      if (videoFiles.length === 0) {
+        throw new Error('Failed to upload videos — none could be uploaded');
+      }
+    }
+
     if (accountEmail && (systemContent || toolResultsContent || chatHistoryContent)) {
       const parts: string[] = [];
       if (systemContent) parts.push(`<system-instructions>\n${systemContent}\n</system-instructions>`);
@@ -388,10 +411,11 @@ async function setupAnthropicSession(
       }
     }
 
-    if (imageFiles.length > 0) {
+    const mediaFiles = [...imageFiles, ...videoFiles];
+    if (mediaFiles.length > 0) {
       processedMessages[0] = {
         ...processedMessages[0],
-        files: [...(processedMessages[0].files || []), ...imageFiles],
+        files: [...(processedMessages[0].files || []), ...mediaFiles],
       };
     }
 
