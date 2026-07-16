@@ -179,6 +179,17 @@ bun start
 
 Runs `bun src/index.tsx` directly (no build step needed — Bun runs TypeScript natively).
 
+### Container release (GHCR)
+
+Do not treat a local `docker build` as the production release path.
+
+1. Push to `main` (after `biome` / `tsc` / `bun test` pass).
+2. CI runs `.github/workflows/ci.yml`.
+3. `.github/workflows/docker-ghcr.yml` builds **`Dockerfile`** and pushes `ghcr.io/highkay/opengate` tags: `latest`, `sha-<short>`, `main`.
+4. Deploy instances pull a **pinned** `sha-*` image (see [DEPLOYMENT.md](DEPLOYMENT.md) and root [AGENTS.md](../AGENTS.md)).
+
+`Dockerfile.local` is only for fast local debugging.
+
 ### Other Commands
 
 ```bash
@@ -785,8 +796,9 @@ The `ConfigSchema` interface in `configService.ts` defines all 23+ known keys. U
 
 Before submitting changes, verify:
 
+- [ ] `bunx biome check src/` passes
+- [ ] `bunx tsc --noEmit` passes
 - [ ] `bun test` passes (all tests green)
-- [ ] No TypeScript errors (`bun src/index.tsx` type-checks without issues)
 - [ ] LSP diagnostics show no errors in changed files
 - [ ] New feature has test coverage
 - [ ] Error paths are handled (not just the happy path)
@@ -794,9 +806,11 @@ Before submitting changes, verify:
 - [ ] New configuration keys are added to `ConfigSchema` in `configService.ts`
 - [ ] No `as any` casts or `// @ts-ignore` comments
 - [ ] No hardcoded secrets or credentials
+- [ ] If the change must run in production: pushed to `main`, GHCR workflow green, instance updated to `sha-*` (see [AGENTS.md](../AGENTS.md))
 
 ---
 
 For architecture overview, see [ARCHITECTURE.md](ARCHITECTURE.md).
 For API reference, see [API.md](API.md).
 For deployment, see [DEPLOYMENT.md](DEPLOYMENT.md).
+For agent dev/release conventions, see [AGENTS.md](../AGENTS.md).

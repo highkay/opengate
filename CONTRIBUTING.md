@@ -24,9 +24,29 @@ bun test            # Run tests
 ## Pull Request Process
 
 1. Update tests to cover your changes
-2. Run `bun test` — all tests must pass
-3. Update relevant documentation in `docs/` if needed
-4. Add a CHANGELOG entry
+2. Run locally before push:
+   - `bunx biome check src/`
+   - `bunx tsc --noEmit`
+   - `bun test`
+3. Update relevant documentation in `docs/` (and `AGENTS.md` if agent/deploy conventions change)
+4. Add a CHANGELOG entry when the change is user-visible
+
+CI (`.github/workflows/ci.yml`) enforces biome, typecheck, and tests on every push/PR.
+
+## Release / container images
+
+Production images are **not** published by hand from a laptop as the default path.
+
+1. Merge or push to `main`.
+2. GitHub Actions **Docker GHCR** (`.github/workflows/docker-ghcr.yml`) builds `Dockerfile` and pushes:
+   - `ghcr.io/highkay/opengate:latest`
+   - `ghcr.io/highkay/opengate:sha-<short>`
+   - `ghcr.io/highkay/opengate:main`
+3. Deploy instances pull a **pinned** `sha-*` tag (see `docs/DEPLOYMENT.md` and `AGENTS.md`).
+
+`Dockerfile.local` is for fast local experimentation only. Docs-only changes do not rebuild GHCR (path filters).
+
+Full agent-oriented checklist: **[AGENTS.md](./AGENTS.md)**.
 
 ## Commit Messages
 

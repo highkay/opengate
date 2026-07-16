@@ -5,6 +5,7 @@ Production deployment for Qwen Gate.
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Docker / GHCR (recommended for this host)](#docker--ghcr-recommended-for-this-host)
 - [PM2 Process Manager](#pm2-process-manager)
 - [systemd Service (Linux)](#systemd-service-linux)
 - [Configuration](#configuration)
@@ -26,6 +27,90 @@ bun start
 ```
 
 The server runs on `http://localhost:26405` by default. Configure via `bun run setup` or edit `config.json` directly.
+
+## Docker / GHCR (recommended for this host)
+
+### How images are published
+
+| Step | Detail |
+|------|--------|
+| Source of truth | GitHub `highkay/opengate` `main` branch |
+| CI quality gate | `.github/workflows/ci.yml` — biome, `tsc --noEmit`, `bun test` |
+| Image build | `.github/workflows/docker-ghcr.yml` — builds **`Dockerfile`**, pushes to GHCR |
+| Triggers | Push to `main` when `Dockerfile` / `package.json` / `bun.lock` / `src/**` / the workflow file change; or `workflow_dispatch` |
+| Registry | `ghcr.io/highkay/opengate` |
+
+**Tags:**
+
+- `latest` — current `main`
+- `sha-<short>` — immutable commit pin (use this in compose)
+- `main` — branch tag
+
+Agent-oriented end-to-end checklist: root **[AGENTS.md](../AGENTS.md)**.
+
+### Deploy tree (`Qwen2api`)
+
+Keep **runtime data separate from source**:
+
+| Path | Purpose |
+|------|---------|
+| `/home/admin/opengate` | Git clone / source + Actions-driven releases |
+| `/home/admin/Qwen2api` | Compose instance: image pin, `config.json`, `.qwen/`, `logs/` |
+
+Example `docker-compose.yml`:
+
+```yaml
+services:
+  qwen2api:
+    image: ghcr.io/highkay/opengate:sha-e1b61dd   # pin to a CI-built SHA
+    container_name: qwen2api
+    restart: unless-stopped
+    init: true
+    environment:
+      PORT: "7860"
+      HOST: "0.0.0.0"
+      NODE_ENV: production
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./.qwen:/app/.qwen
+      - ./config.json:/app/config.json
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7860/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+```
+
+### Update instance to a new release
+
+```bash
+# After GitHub Actions "Docker GHCR" succeeds for commit <short>
+docker login ghcr.io   # if package is private
+docker pull ghcr.io/highkay/opengate:sha-<short>
+docker pull ghcr.io/highkay/opengate:latest
+
+cd /home/admin/Qwen2api
+# set image: ghcr.io/highkay/opengate:sha-<short>
+echo '<short>' > OPENGATE_COMMIT
+docker compose up -d --force-recreate
+curl -sS http://127.0.0.1:7860/ping
+```
+
+### Local image builds (debug only)
+
+| File | Use |
+|------|-----|
+| `Dockerfile` | Same as GHCR CI (full deps, larger) |
+| `Dockerfile.local` | Faster local rebuilds (slim runtime) |
+
+```bash
+docker build -f Dockerfile.local -t ghcr.io/highkay/opengate:local-$(git rev-parse --short HEAD) .
+```
+
+Do **not** leave production compose on `local-*` tags after a real fix is merged — promote via GHCR `sha-*`.
 
 ## PM2 Process Manager
 
