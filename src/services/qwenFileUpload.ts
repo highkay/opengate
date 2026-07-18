@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { getTokenWithAccount } from './auth.ts';
+import { getTokenWithAccount, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_API_BASE } from './qwen.ts';
@@ -23,6 +23,83 @@ interface StsTokenResponse {
   file_id: string;
   file_path: string;
   file_url: string;
+}
+
+/** Error from getstsToken with structured upstream fields for account retry. */
+export class StsTokenError extends Error {
+  readonly code: string;
+  readonly upstreamStatus: number;
+  readonly retryHours?: number;
+
+  constructor(message: string, code: string, upstreamStatus: number, retryHours?: number) {
+    super(message);
+    this.name = 'StsTokenError';
+    this.code = code;
+    this.upstreamStatus = upstreamStatus;
+    this.retryHours = retryHours;
+  }
+}
+
+function isValidStsToken(data: unknown): data is StsTokenResponse {
+  if (!data || typeof data !== 'object') return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.access_key_id === 'string' &&
+    !!d.access_key_id &&
+    typeof d.access_key_secret === 'string' &&
+    !!d.access_key_secret &&
+    typeof d.security_token === 'string' &&
+    !!d.security_token &&
+    typeof d.bucketname === 'string' &&
+    !!d.bucketname &&
+    typeof d.endpoint === 'string' &&
+    !!d.endpoint &&
+    typeof d.file_id === 'string' &&
+    !!d.file_id &&
+    typeof d.file_path === 'string' &&
+    !!d.file_path &&
+    typeof d.file_url === 'string' &&
+    !!d.file_url
+  );
+}
+
+/**
+ * Parse getstsToken JSON body. Rejects success:false (e.g. RateLimited) and incomplete STS payloads.
+ * On RateLimited, throttles the account for the duration Qwen reports (`num` hours).
+ * Exported for unit tests.
+ */
+export function parseStsTokenResponse(resData: any, email: string): StsTokenResponse {
+  // Qwen returns HTTP 200 with { success:false, data:{ code, details, num } } on daily limits.
+  // `data` is present but is NOT STS credentials — must not treat it as upload tokens.
+  if (resData?.success === false || !isValidStsToken(resData?.data)) {
+    const errBody = resData?.data && typeof resData.data === 'object' ? resData.data : resData;
+    const code = errBody?.code || resData?.code || 'UnexpectedStsResponse';
+    const details = String(
+      errBody?.details || errBody?.message || resData?.message || 'getstsToken returned invalid STS credentials',
+    ).replace(/\.+$/, '');
+    const retryHours = typeof errBody?.num === 'number' ? errBody.num : undefined;
+    const wait = retryHours !== undefined ? ` Wait about ${retryHours} hour(s) before trying again.` : '';
+
+    if (code === 'RateLimited') {
+      // Use full duration from Qwen (same as chat stream RateLimited handling) — do not cap.
+      const throttleMs = (retryHours || 1) * 3600_000;
+      throttleAccount(email, throttleMs);
+      logStore.log(
+        'warn',
+        'upload',
+        `[FileUpload] getstsToken RateLimited for ${email} — throttled ${retryHours || 1}h: ${details}`,
+      );
+    }
+
+    throw new StsTokenError(
+      `getstsToken failed: ${code} — ${details}.${wait}`,
+      code,
+      code === 'RateLimited' ? 429 : 502,
+      retryHours,
+    );
+  }
+
+  return resData.data;
 }
 
 /**
@@ -96,11 +173,13 @@ async function getstsToken(email: string, filename: string, filesize: number, fi
     throw new Error(`getstsToken failed: ${response.status} — ${errText.substring(0, 200)}`);
   }
   const resText = await response.text();
-  const resData = JSON.parse(resText);
-  if (!resData.data) {
-    throw new Error(`getstsToken returned unexpected response: ${resText.substring(0, 200)}`);
+  let resData: any;
+  try {
+    resData = JSON.parse(resText);
+  } catch {
+    throw new Error(`getstsToken returned non-JSON response: ${resText.substring(0, 200)}`);
   }
-  return resData.data;
+  return parseStsTokenResponse(resData, email);
 }
 
 // --- Step 2: Upload file content to Alibaba Cloud OSS ---
@@ -130,6 +209,9 @@ function buildOssCanonicalRequest(
 async function uploadToOss(sts: StsTokenResponse, fileContent: Buffer, contentType: string): Promise<string> {
   const date = new Date().toUTCString();
   const key = sts.file_path;
+  if (typeof key !== 'string' || !key) {
+    throw new Error('Invalid STS token: missing file_path (cannot upload to OSS)');
+  }
 
   // file_path may or may not include the bucket prefix.
   // CanonicalizedResource = /{bucket}/{objectKey} where objectKey is WITHOUT the bucket prefix.

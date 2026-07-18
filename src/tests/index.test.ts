@@ -6,7 +6,8 @@ process.env.TEST_MOCK_PLAYWRIGHT = 'true';
 process.env.API_KEY = 'test-key-for-testing';
 
 import { app } from '../index.tsx';
-import { accounts } from '../services/accountManager.ts';
+import { accounts, rebuildEmailIndex } from '../services/accountManager.ts';
+import { isAccountThrottled } from '../services/auth.ts';
 
 const TEST_API_KEY = 'test-key-for-testing';
 const authHeaders = { Authorization: `Bearer ${TEST_API_KEY}` };
@@ -321,6 +322,7 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
       stsCalled = true;
       return new Response(
         JSON.stringify({
+          success: true,
           data: {
             access_key_id: 'test-key',
             access_key_secret: 'test-secret',
@@ -425,6 +427,142 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
   }
 });
 
+test('Chat image upload RateLimited STS retries next account and throttles limited one', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+  accounts.splice(0, accounts.length);
+
+  accounts.push(
+    {
+      email: 'limited-upload@qwen-gate.dev',
+      password: 'test',
+      state: { token: 'limited-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+      lastUsed: 0,
+      throttledUntil: 0,
+      refreshInFlight: null,
+      loginAttempt: 0,
+      inFlight: 0,
+      totalRequests: 0,
+      startupStatus: 'ready',
+    },
+    {
+      email: 'ok-upload@qwen-gate.dev',
+      password: 'test',
+      state: { token: 'ok-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+      lastUsed: 0,
+      throttledUntil: 0,
+      refreshInFlight: null,
+      loginAttempt: 0,
+      inFlight: 0,
+      totalRequests: 0,
+      startupStatus: 'ready',
+    },
+  );
+  rebuildEmailIndex();
+
+  const stsByAccount: string[] = [];
+  let chatPayload: any = null;
+
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      const cookie = (init?.headers?.cookie || init?.headers?.Cookie || '') as string;
+      const account = cookie.includes('limited-token') ? 'limited-upload@qwen-gate.dev' : 'ok-upload@qwen-gate.dev';
+      stsByAccount.push(account);
+      if (account === 'limited-upload@qwen-gate.dev') {
+        // Production shape that previously caused objectKey.startsWith crash
+        return new Response(
+          JSON.stringify({
+            success: false,
+            request_id: 'rate-limited',
+            data: {
+              code: 'RateLimited',
+              details: "You've reached the upper limit for today's usage.",
+              num: 19,
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          success: true,
+          data: {
+            access_key_id: 'test-key',
+            access_key_secret: 'test-secret',
+            security_token: 'test-token',
+            bucketname: 'test-bucket',
+            region: 'oss-cn-hangzhou',
+            endpoint: 'oss-cn-hangzhou.aliyuncs.com',
+            file_id: 'ok-file-id',
+            file_path: 'test-user/ok-file-id_image.png',
+            file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/ok-file-id_image.png',
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const bodyStr =
+        typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
+      try {
+        chatPayload = JSON.parse(bodyStr);
+      } catch {}
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices": [{"delta": {"content": "ok"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const payload = {
+      model: 'qwen3.6-plus',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'describe' },
+            { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAA=' } },
+          ],
+        },
+      ],
+      stream: false,
+    };
+
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer test-key-for-testing' }),
+      body: JSON.stringify(payload),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200, await res.text());
+
+    // First pick hits limited account STS; then retries healthy account
+    assert.ok(stsByAccount.includes('limited-upload@qwen-gate.dev'), 'should attempt limited account');
+    assert.ok(stsByAccount.includes('ok-upload@qwen-gate.dev'), 'should retry healthy account');
+    assert.ok(isAccountThrottled('limited-upload@qwen-gate.dev'), 'limited account must be throttled after RateLimited STS');
+    assert.ok(!isAccountThrottled('ok-upload@qwen-gate.dev'), 'healthy account must not be throttled');
+    assert.ok(chatPayload?.messages?.[0]?.files?.length > 0, 'should attach uploaded image from healthy account');
+  } finally {
+    globalThis.fetch = originalFetch;
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
 test('Chat completions with video uploads attaches files (t2t chat_type, video class)', async () => {
   const originalFetch = globalThis.fetch;
   const originalAccounts = [...accounts];
@@ -461,6 +599,7 @@ test('Chat completions with video uploads attaches files (t2t chat_type, video c
       } catch {}
       return new Response(
         JSON.stringify({
+          success: true,
           data: {
             access_key_id: 'test-key',
             access_key_secret: 'test-secret',

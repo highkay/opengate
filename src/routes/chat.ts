@@ -1,12 +1,12 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { decrementInFlight, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
-import { uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
+import { StsTokenError, uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { OpenAIRequest } from '../types/openai.ts';
@@ -178,16 +178,19 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       throw lastError || new Error('All accounts are rate-limited. Please wait and try again later.');
     }
 
-    // Upload images/videos with concurrency limit — impers worker handles concurrency
+    // Upload images/videos with concurrency limit — impers worker handles concurrency.
+    // On total failure: release inFlight, try next account (RateLimited already throttled in getstsToken).
     let imageFiles: QwenFileAttachment[] = [];
     if (hasImages && accountEmail) {
       const MAX_CONCURRENT = 2;
+      const uploadErrors: any[] = [];
       for (let i = 0; i < imageUrls.length; i += MAX_CONCURRENT) {
         const batch = imageUrls.slice(i, i + MAX_CONCURRENT);
         const results = await Promise.all(
           batch.map((url) =>
             uploadImageAsFile(accountEmail, url).catch((err: any) => {
               logStore.log('warn', 'chat', `[Chat] Image upload failed: ${err.message}`);
+              uploadErrors.push(err);
               return null;
             }),
           ),
@@ -195,23 +198,53 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         imageFiles.push(...results.filter((f): f is QwenFileAttachment => f !== null));
       }
       if (imageFiles.length === 0) {
-        throw new Error('Failed to upload images — none of the image files could be uploaded');
+        const primary = uploadErrors[0];
+        const err =
+          primary instanceof StsTokenError
+            ? primary
+            : Object.assign(new Error(`Failed to upload images — none of the image files could be uploaded: ${primary?.message || 'unknown'}`), {
+                cause: primary,
+                upstreamStatus: primary?.upstreamStatus,
+                code: primary?.code,
+              });
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        decrementInFlight(accountEmail);
+        logStore.log('warn', 'chat', `[Chat] Image upload exhausted for ${accountEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`);
+        logStore.addError(logId, `Image upload failed for ${accountEmail}: ${err.message}`);
+        continue;
       }
     }
 
     let videoFiles: QwenFileAttachment[] = [];
     if (hasVideos && accountEmail) {
       // Videos are larger — upload sequentially to avoid memory spikes
+      const uploadErrors: any[] = [];
       for (const url of videoUrls) {
         try {
           const file = await uploadVideoAsFile(accountEmail, url);
           videoFiles.push(file);
         } catch (err: any) {
           logStore.log('warn', 'chat', `[Chat] Video upload failed: ${err.message}`);
+          uploadErrors.push(err);
         }
       }
       if (videoFiles.length === 0) {
-        throw new Error('Failed to upload videos — none of the video files could be uploaded');
+        const primary = uploadErrors[0];
+        const err =
+          primary instanceof StsTokenError
+            ? primary
+            : Object.assign(new Error(`Failed to upload videos — none of the video files could be uploaded: ${primary?.message || 'unknown'}`), {
+                cause: primary,
+                upstreamStatus: primary?.upstreamStatus,
+                code: primary?.code,
+              });
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        decrementInFlight(accountEmail);
+        logStore.log('warn', 'chat', `[Chat] Video upload exhausted for ${accountEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`);
+        logStore.addError(logId, `Video upload failed for ${accountEmail}: ${err.message}`);
+        continue;
       }
     }
 

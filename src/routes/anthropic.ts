@@ -1,13 +1,13 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { decrementInFlight, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
-import { uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
+import { StsTokenError, uploadImageAsFile, uploadLargeTextAsFile, uploadVideoAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import type { OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
@@ -366,12 +366,14 @@ async function setupAnthropicSession(
     let imageFiles: QwenFileAttachment[] = [];
     if (hasImages && accountEmail) {
       const MAX_CONCURRENT = 2;
+      const uploadErrors: any[] = [];
       for (let i = 0; i < imageUrls.length; i += MAX_CONCURRENT) {
         const batch = imageUrls.slice(i, i + MAX_CONCURRENT);
         const results = await Promise.all(
           batch.map((url) =>
             uploadImageAsFile(accountEmail, url).catch((err: any) => {
               logStore.log('warn', 'chat', `[Anthropic] Image upload failed: ${err.message}`);
+              uploadErrors.push(err);
               return null;
             }),
           ),
@@ -379,22 +381,60 @@ async function setupAnthropicSession(
         imageFiles.push(...results.filter((f): f is QwenFileAttachment => f !== null));
       }
       if (imageFiles.length === 0) {
-        throw new Error('Failed to upload images — none could be uploaded');
+        const primary = uploadErrors[0];
+        const err =
+          primary instanceof StsTokenError
+            ? primary
+            : Object.assign(new Error(`Failed to upload images — none could be uploaded: ${primary?.message || 'unknown'}`), {
+                cause: primary,
+                upstreamStatus: primary?.upstreamStatus,
+                code: primary?.code,
+              });
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        decrementInFlight(accountEmail);
+        logStore.log(
+          'warn',
+          'chat',
+          `[Anthropic] Image upload exhausted for ${accountEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`,
+        );
+        logStore.addError(logId, `Image upload failed for ${accountEmail}: ${err.message}`);
+        continue;
       }
     }
 
     let videoFiles: QwenFileAttachment[] = [];
     if (hasVideos && accountEmail) {
+      const uploadErrors: any[] = [];
       for (const url of videoUrls) {
         try {
           const file = await uploadVideoAsFile(accountEmail, url);
           videoFiles.push(file);
         } catch (err: any) {
           logStore.log('warn', 'chat', `[Anthropic] Video upload failed: ${err.message}`);
+          uploadErrors.push(err);
         }
       }
       if (videoFiles.length === 0) {
-        throw new Error('Failed to upload videos — none could be uploaded');
+        const primary = uploadErrors[0];
+        const err =
+          primary instanceof StsTokenError
+            ? primary
+            : Object.assign(new Error(`Failed to upload videos — none could be uploaded: ${primary?.message || 'unknown'}`), {
+                cause: primary,
+                upstreamStatus: primary?.upstreamStatus,
+                code: primary?.code,
+              });
+        lastFailedEmail = accountEmail;
+        lastError = err;
+        decrementInFlight(accountEmail);
+        logStore.log(
+          'warn',
+          'chat',
+          `[Anthropic] Video upload exhausted for ${accountEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`,
+        );
+        logStore.addError(logId, `Video upload failed for ${accountEmail}: ${err.message}`);
+        continue;
       }
     }
 

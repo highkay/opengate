@@ -208,6 +208,9 @@ export function rebuildEmailIndex(): void {
 }
 
 export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
+  // Tests mutate the in-memory registry; never persist mock accounts to disk.
+  if (process.env.TEST_MOCK_PLAYWRIGHT) return;
+
   const dir = path.dirname(ACCOUNTS_FILE);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
