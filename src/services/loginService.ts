@@ -10,10 +10,10 @@ import type { AuthState } from '../types/auth.ts';
 import {
   clearLastLoginFailure,
   getLastLoginFailure,
+  type LoginFailure,
   loginFreshViaBrowser,
   loginFreshViaFetch,
   loginViaTempContext,
-  type LoginFailure,
 } from './loginHelpers.ts';
 import { logStore } from './logStore.ts';
 import { getActivePage, getBrowser, Mutex } from './playwright.ts';

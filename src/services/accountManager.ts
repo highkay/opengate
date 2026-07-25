@@ -336,9 +336,7 @@ export async function addAccount(email: string, password: string): Promise<{ log
   if (profileResult === 'captcha') {
     parts.push('Browser: CAPTCHA required — use dashboard Autofill to complete manually');
   } else if (profileResult === 'error' || profileResult === 'closed') {
-    parts.push(
-      'Browser: launch/login failed (often Alpine + cloakbrowser glibc Chromium mismatch — check system logs for ENOENT)',
-    );
+    parts.push('Browser: launch/login failed (often Alpine + cloakbrowser glibc Chromium mismatch — check system logs for ENOENT)');
   } else {
     parts.push(`Browser: ${profileResult}`);
   }

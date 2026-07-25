@@ -134,7 +134,13 @@ function failureFromThrown(err: unknown): LoginFailure {
       retryable: true,
     };
   }
-  if (lower.includes('abort') || lower.includes('timeout') || lower.includes('timed out') || lower.includes('network') || lower.includes('econn')) {
+  if (
+    lower.includes('abort') ||
+    lower.includes('timeout') ||
+    lower.includes('timed out') ||
+    lower.includes('network') ||
+    lower.includes('econn')
+  ) {
     return {
       code: 'network',
       message: `Network error during API login: ${msg}`,
@@ -397,8 +403,7 @@ async function loginFreshViaFetchOnce(
       return { state: null, failure: businessFail };
     }
 
-    const summary =
-      data && typeof data === 'object' ? JSON.stringify(data).substring(0, 200) : String(data).substring(0, 200);
+    const summary = data && typeof data === 'object' ? JSON.stringify(data).substring(0, 200) : String(data).substring(0, 200);
     return {
       state: null,
       failure: {

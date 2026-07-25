@@ -10,8 +10,7 @@ describe('isWafResponseBody', () => {
   });
 
   test('detects aliyun_waf markers in body', () => {
-    const html =
-      '<!doctypehtml><meta charset="UTF-8"><meta name="aliyun_waf_aa" content="abc"><title>x</title>';
+    const html = '<!doctypehtml><meta charset="UTF-8"><meta name="aliyun_waf_aa" content="abc"><title>x</title>';
     expect(isWafResponseBody(html, 'application/json')).toBe(true);
   });
 
@@ -20,12 +19,7 @@ describe('isWafResponseBody', () => {
   });
 
   test('allows normal JSON', () => {
-    expect(
-      isWafResponseBody(
-        JSON.stringify({ success: true, data: { token: 'abc' } }),
-        'application/json',
-      ),
-    ).toBe(false);
+    expect(isWafResponseBody(JSON.stringify({ success: true, data: { token: 'abc' } }), 'application/json')).toBe(false);
   });
 
   test('empty body is not WAF by itself', () => {
