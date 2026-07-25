@@ -6,12 +6,147 @@
 
 import crypto from 'crypto';
 import type { AuthState } from '../types/auth.ts';
-import { checkPlaywrightSession, getAuthTokenMaxAgeMs } from './auth.ts';
+import { getAuthTokenMaxAgeMs } from './auth.ts';
+import { browserlessFetch } from './browserlessFetch.ts';
 import { logStore } from './logStore.ts';
 import { AccountContext, createAccountContext, getActivePage, getBrowser, Mutex, removeAccountContext } from './playwright.ts';
-import { createFetchTimeout, QWEN_BX_V } from './qwen.ts';
+import { createFetchTimeout } from './qwen.ts';
 
 const QWEN_CHAT_URL = 'https://chat.qwen.ai';
+
+/** Classified API-login failure for accurate UI / log messages. */
+export type LoginFailureCode =
+  | 'waf'
+  | 'credentials'
+  | 'not_registered'
+  | 'http_error'
+  | 'network'
+  | 'empty_response'
+  | 'no_token'
+  | 'unknown';
+
+export interface LoginFailure {
+  code: LoginFailureCode;
+  message: string;
+  /** True when a limited backoff retry may help (WAF/network blips). */
+  retryable: boolean;
+}
+
+let lastLoginFailure: LoginFailure | null = null;
+
+export function getLastLoginFailure(): LoginFailure | null {
+  return lastLoginFailure;
+}
+
+export function clearLastLoginFailure(): void {
+  lastLoginFailure = null;
+}
+
+function setLastLoginFailure(failure: LoginFailure): void {
+  lastLoginFailure = failure;
+}
+
+const API_LOGIN_MAX_ATTEMPTS = 3;
+const API_LOGIN_BASE_DELAY_MS = 800;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Detect Aliyun WAF / challenge HTML masquerading as a 200. Exported for tests. */
+export function isWafResponseBody(bodyText: string, contentType: string | null | undefined): boolean {
+  const ct = (contentType || '').toLowerCase();
+  if (ct.includes('text/html')) return true;
+  const trimmed = bodyText.trimStart().toLowerCase();
+  if (trimmed.startsWith('<!doctype') || trimmed.startsWith('<html') || trimmed.startsWith('<head')) return true;
+  if (/aliyun_waf/i.test(bodyText)) return true;
+  if (/name=["']aliyun_waf_/i.test(bodyText)) return true;
+  return false;
+}
+
+function extractTokensFromSetCookie(response: Response): { token: string | null; refreshToken: string | null } {
+  let token: string | null = null;
+  let refreshToken: string | null = null;
+  const hdrs = response.headers as Headers & { getSetCookie?: () => string[] };
+  const setCookies: string[] =
+    typeof hdrs.getSetCookie === 'function' ? hdrs.getSetCookie() : (response.headers.get('set-cookie') || '').split(/,(?=\s*[^;]+=)/);
+
+  for (const cookie of setCookies) {
+    if (!cookie) continue;
+    const tokenMatch = cookie.match(/(?:^|,\s*)token=([^;]+)/i) || cookie.match(/\btoken=([^;]+)/i);
+    if (tokenMatch && !token) token = tokenMatch[1];
+    const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/i);
+    if (refreshMatch) refreshToken = refreshMatch[1];
+  }
+  return { token, refreshToken };
+}
+
+function classifyBusinessFailure(data: any): LoginFailure | null {
+  if (!data || typeof data !== 'object') return null;
+  if (data.success === true) return null;
+
+  const details = String(data?.data?.details || data?.details || data?.message || data?.error || '').trim();
+  const code = String(data?.data?.code || data?.code || '').trim();
+  const combined = `${code} ${details}`.toLowerCase();
+
+  if (combined.includes('not registered') || combined.includes('sign up first')) {
+    return {
+      code: 'not_registered',
+      message: details || 'Account is not registered on Qwen',
+      retryable: false,
+    };
+  }
+  if (
+    combined.includes('password') ||
+    combined.includes('credential') ||
+    combined.includes('unauthorized') ||
+    combined.includes('invalid') ||
+    code === 'Unauthorized' ||
+    code === 'Bad_Request'
+  ) {
+    // Bad_Request without "not registered" still often means credential/account issues
+    return {
+      code: 'credentials',
+      message: details || code || 'Invalid credentials or account rejected by Qwen',
+      retryable: false,
+    };
+  }
+  if (data.success === false) {
+    return {
+      code: 'no_token',
+      message: details || code || 'Qwen rejected sign-in (success=false, no token)',
+      retryable: false,
+    };
+  }
+  return null;
+}
+
+function failureFromThrown(err: unknown): LoginFailure {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (
+    lower.includes('waf') ||
+    lower.includes('aliyun_waf') ||
+    lower.includes('cookie refresh failed') ||
+    lower.includes('challenge persists')
+  ) {
+    return {
+      code: 'waf',
+      message: `Blocked by Aliyun WAF during API login: ${msg}`,
+      retryable: true,
+    };
+  }
+  if (lower.includes('abort') || lower.includes('timeout') || lower.includes('timed out') || lower.includes('network') || lower.includes('econn')) {
+    return {
+      code: 'network',
+      message: `Network error during API login: ${msg}`,
+      retryable: true,
+    };
+  }
+  return {
+    code: 'unknown',
+    message: `API login error: ${msg}`,
+    retryable: true,
+  };
+}
 
 /**
  * Login via browser context — executes signin API inside the browser via evaluate().
@@ -143,76 +278,184 @@ export async function loginFreshViaBrowser(email: string, hashedPassword: string
 }
 
 /**
- * Login via plain fetch — fallback for when Playwright is not available.
+ * Single attempt: sign-in via browserlessFetch (wreq + acw_tc + bx headers).
+ * Same transport stack as chat — not bare global fetch.
  */
-export async function loginFreshViaFetch(email: string, hashedPassword: string): Promise<AuthState | null> {
-  const { controller, cleanup: _cleanup } = createFetchTimeout();
+async function loginFreshViaFetchOnce(
+  email: string,
+  hashedPassword: string,
+): Promise<{ state: AuthState | null; failure: LoginFailure | null }> {
+  const { controller, cleanup } = createFetchTimeout();
   try {
-    const response = await fetch(`${QWEN_CHAT_URL}/api/v2/auths/signin`, {
+    const response = await browserlessFetch(`${QWEN_CHAT_URL}/api/v2/auths/signin`, {
       method: 'POST',
       headers: {
         accept: 'application/json, text/plain, */*',
         'content-type': 'application/json',
         source: 'web',
         Version: '0.2.57',
-        'bx-v': QWEN_BX_V,
         Referer: `${QWEN_CHAT_URL}/auth`,
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         'x-request-id': crypto.randomUUID(),
       },
       body: JSON.stringify({ email, password: hashedPassword }),
       signal: controller.signal,
+      accountEmail: email,
     });
 
-    if (response.ok) {
-      let data: any;
+    const contentType = response.headers.get('content-type');
+    const rawText = await response.text();
+
+    if (isWafResponseBody(rawText, contentType)) {
+      return {
+        state: null,
+        failure: {
+          code: 'waf',
+          message: `Aliyun WAF challenge on sign-in (HTTP ${response.status}, content-type=${contentType || 'unknown'})`,
+          retryable: true,
+        },
+      };
+    }
+
+    let data: any = {};
+    if (rawText.trim()) {
       try {
-        data = await response.json();
+        data = JSON.parse(rawText);
       } catch {
-        data = {};
-      }
-
-      let token = data.data?.token || data.token || data.data?.session_token || null;
-      let refreshToken = data.data?.refresh_token || data.refresh_token || null;
-
-      if (!token) {
-        const hdrs = response.headers as Headers & { getSetCookie?: () => string[] };
-        const setCookies: string[] =
-          typeof hdrs.getSetCookie === 'function' ? hdrs.getSetCookie() : (response.headers.get('set-cookie') || '').split(',');
-
-        for (const cookie of setCookies) {
-          const tokenMatch = cookie.match(/\btoken=([^;]+)/);
-          if (tokenMatch && !token) token = tokenMatch[1];
-          const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/);
-          if (refreshMatch) refreshToken = refreshMatch[1];
-        }
-      }
-
-      if (token) {
         return {
+          state: null,
+          failure: {
+            code: 'empty_response',
+            message: `Non-JSON sign-in response (HTTP ${response.status}): ${rawText.substring(0, 120)}`,
+            retryable: true,
+          },
+        };
+      }
+    } else if (response.ok) {
+      // Empty body with 200 — historically logged as {} and mislabeled as CAPTCHA
+      const fromCookie = extractTokensFromSetCookie(response);
+      if (fromCookie.token) {
+        return {
+          state: {
+            token: fromCookie.token,
+            expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
+            refreshToken: fromCookie.refreshToken,
+          },
+          failure: null,
+        };
+      }
+      return {
+        state: null,
+        failure: {
+          code: 'empty_response',
+          message: `Empty sign-in body (HTTP ${response.status}) — not a credential error`,
+          retryable: true,
+        },
+      };
+    }
+
+    if (!response.ok) {
+      const business = classifyBusinessFailure(data);
+      if (business) return { state: null, failure: business };
+      return {
+        state: null,
+        failure: {
+          code: 'http_error',
+          message: `Sign-in HTTP ${response.status}: ${rawText.substring(0, 160)}`,
+          retryable: response.status >= 500 || response.status === 429,
+        },
+      };
+    }
+
+    const businessFail = classifyBusinessFailure(data);
+    // success:false with details → definitive business failure (no token expected)
+    if (businessFail && data?.success === false) {
+      return { state: null, failure: businessFail };
+    }
+
+    let token = data?.data?.token || data?.token || data?.data?.session_token || null;
+    let refreshToken = data?.data?.refresh_token || data?.refresh_token || null;
+
+    if (!token) {
+      const fromCookie = extractTokensFromSetCookie(response);
+      if (fromCookie.token) token = fromCookie.token;
+      if (fromCookie.refreshToken) refreshToken = fromCookie.refreshToken;
+    }
+
+    if (token) {
+      return {
+        state: {
           token,
           expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
           refreshToken,
-        };
-      }
-
-      const hasPlaywrightSession = await checkPlaywrightSession();
-      if (hasPlaywrightSession) {
-        logStore.log(
-          'warn',
-          'auth',
-          `API login returned 200 but no token for ${email}, and Playwright session exists but has no usable token`,
-        );
-      }
-
-      logStore.log('warn', 'auth', `API login returned 200 but no token for ${email}: ${JSON.stringify(data).substring(0, 200)}`);
-    } else {
-      const errText = await response.text();
-      logStore.log('error', 'auth', `Login failed for ${email} (${response.status}): ${errText.substring(0, 200)}`);
+        },
+        failure: null,
+      };
     }
-  } catch (err: any) {
-    logStore.log('error', 'auth', `Login error for ${email}: ${err.message}`);
+
+    if (businessFail) {
+      return { state: null, failure: businessFail };
+    }
+
+    const summary =
+      data && typeof data === 'object' ? JSON.stringify(data).substring(0, 200) : String(data).substring(0, 200);
+    return {
+      state: null,
+      failure: {
+        code: 'no_token',
+        message: `Sign-in returned HTTP ${response.status} but no token: ${summary || '(empty)'}`,
+        retryable: false,
+      },
+    };
+  } catch (err: unknown) {
+    return { state: null, failure: failureFromThrown(err) };
+  } finally {
+    cleanup();
+  }
+}
+
+/**
+ * Login via browserlessFetch (wreq TLS + acw_tc + bx) with limited backoff retries.
+ * Retries only WAF / network / transient HTTP failures — never credential errors.
+ */
+export async function loginFreshViaFetch(email: string, hashedPassword: string): Promise<AuthState | null> {
+  clearLastLoginFailure();
+  let lastFailure: LoginFailure | null = null;
+
+  for (let attempt = 1; attempt <= API_LOGIN_MAX_ATTEMPTS; attempt++) {
+    const { state, failure } = await loginFreshViaFetchOnce(email, hashedPassword);
+    if (state) {
+      clearLastLoginFailure();
+      if (attempt > 1) {
+        logStore.log('info', 'auth', `API login succeeded for ${email} on attempt ${attempt}/${API_LOGIN_MAX_ATTEMPTS}`);
+      }
+      return state;
+    }
+
+    lastFailure = failure;
+    const canRetry = !!failure?.retryable && attempt < API_LOGIN_MAX_ATTEMPTS;
+    if (!canRetry) break;
+
+    const delay = API_LOGIN_BASE_DELAY_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+    logStore.log(
+      'warn',
+      'auth',
+      `API login attempt ${attempt}/${API_LOGIN_MAX_ATTEMPTS} failed for ${email} (${failure?.code}): ${failure?.message}. Retrying in ${delay}ms...`,
+    );
+    await sleep(delay);
+  }
+
+  if (lastFailure) {
+    setLastLoginFailure(lastFailure);
+    logStore.log('warn', 'auth', `API login failed for ${email} [${lastFailure.code}]: ${lastFailure.message}`);
+  } else {
+    const fallback: LoginFailure = {
+      code: 'unknown',
+      message: 'API login failed with no classified reason',
+      retryable: false,
+    };
+    setLastLoginFailure(fallback);
+    logStore.log('warn', 'auth', `API login failed for ${email}: ${fallback.message}`);
   }
 
   return null;

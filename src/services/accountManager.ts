@@ -10,7 +10,7 @@ import path from 'path';
 import type { AccountEntry } from '../types/auth.ts';
 import { projectPath } from '../utils/paths.ts';
 import { config } from './configService.ts';
-import { loginFresh } from './loginService.ts';
+import { getLastLoginFailure, loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 import { configureAccount } from './qwenModels.ts';
 
@@ -289,7 +289,25 @@ export async function addAccount(email: string, password: string): Promise<{ log
   rebuildEmailIndex();
   saveAccountsToFile(accounts);
 
-  // Step 1: Create and authorize the browser profile
+  // Step 1: API login first (browserlessFetch / wreq — same stack as chat).
+  // Browser profile is CAPTCHA/manual fallback only; cloakbrowser often fails on Alpine.
+  const newState = await loginFresh(normalizedEmail, password);
+  if (newState) {
+    entry.state = newState;
+    await configureAccount(normalizedEmail).catch((err) =>
+      logStore.log('error', 'account', `Failed to configure ${normalizedEmail}: ${err.message}`),
+    );
+    return { loginSucceeded: true };
+  }
+
+  const apiFailure = getLastLoginFailure();
+  logStore.log(
+    'warn',
+    'account',
+    `API login failed for ${normalizedEmail}${apiFailure ? ` [${apiFailure.code}]` : ''} — trying browser profile...`,
+  );
+
+  // Step 2: Browser profile fallback (headless, then headed on CAPTCHA)
   const { openBrowserProfile } = await import('./browserProfiles.ts');
   let profileResult = await openBrowserProfile(normalizedEmail, password, { headless: true });
   if (profileResult === 'captcha') {
@@ -298,7 +316,6 @@ export async function addAccount(email: string, password: string): Promise<{ log
   }
 
   if (profileResult === 'success') {
-    // Step 2: Extract token from the now-authenticated profile
     const { loadCookiesFromProfile } = await import('./auth.ts');
     const profileState = await loadCookiesFromProfile(normalizedEmail);
     if (profileState) {
@@ -310,19 +327,24 @@ export async function addAccount(email: string, password: string): Promise<{ log
     }
   }
 
-  // Fallback: try API login if profile authorization failed
-  const newState = await loginFresh(normalizedEmail, password);
-  if (newState) {
-    entry.state = newState;
-    await configureAccount(normalizedEmail).catch((err) =>
-      logStore.log('error', 'account', `Failed to configure ${normalizedEmail}: ${err.message}`),
-    );
-    return { loginSucceeded: true };
+  const parts: string[] = [`Login failed for ${normalizedEmail}`];
+  if (apiFailure) {
+    parts.push(`API: [${apiFailure.code}] ${apiFailure.message}`);
   } else {
-    const msg = `Login failed: wrong password or CAPTCHA required for ${normalizedEmail}. Check system logs.`;
-    logStore.log('warn', 'auth', msg);
-    return { loginSucceeded: false, loginError: msg };
+    parts.push('API: no token');
   }
+  if (profileResult === 'captcha') {
+    parts.push('Browser: CAPTCHA required — use dashboard Autofill to complete manually');
+  } else if (profileResult === 'error' || profileResult === 'closed') {
+    parts.push(
+      'Browser: launch/login failed (often Alpine + cloakbrowser glibc Chromium mismatch — check system logs for ENOENT)',
+    );
+  } else {
+    parts.push(`Browser: ${profileResult}`);
+  }
+  const msg = parts.join('. ');
+  logStore.log('warn', 'auth', msg);
+  return { loginSucceeded: false, loginError: msg };
 }
 export async function removeAccount(email: string): Promise<void> {
   const normalizedEmail = email.toLowerCase().trim();

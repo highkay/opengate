@@ -126,23 +126,45 @@ accountsRouter.get('/:email/login', async (c) => {
       return c.json({ error: { message: 'No password stored for this account' } }, 400);
     }
 
-    // Authorize the browser profile — creates profile, logs in, saves cookie
+    // Prefer API login (browserlessFetch) — same path that historically issued tokens
+    const { loginFresh, getLastLoginFailure } = await import('../services/loginService.ts');
+    const apiState = await loginFresh(account.email, account.password);
+    if (apiState) {
+      account.state = apiState;
+      const { saveCookies } = await import('../services/auth.ts');
+      await saveCookies(account.email, apiState.token, apiState.refreshToken, apiState.expiresAt);
+      return c.json({ success: true, email: account.email, authenticated: true, method: 'api' });
+    }
+
+    const apiFailure = getLastLoginFailure();
+
+    // Browser profile fallback
     const { openBrowserProfile } = await import('../services/playwright.ts');
     const loginResult = await openBrowserProfile(account.email, account.password, { headless: true });
 
     if (loginResult === 'success') {
-      // Re-read token from the now-authenticated profile
       const { loadCookiesFromProfile } = await import('../services/auth.ts');
       const profileState = await loadCookiesFromProfile(account.email);
       if (profileState) {
         account.state = profileState;
-        return c.json({ success: true, email: account.email, authenticated: true });
+        return c.json({ success: true, email: account.email, authenticated: true, method: 'browser' });
       }
-      return c.json({ success: true, email: account.email, authenticated: true });
+      return c.json({ success: true, email: account.email, authenticated: true, method: 'browser' });
     } else if (loginResult === 'captcha') {
-      return c.json({ error: { message: 'CAPTCHA required — use autofill to complete manually' } }, 400);
+      return c.json(
+        {
+          error: {
+            message: 'CAPTCHA required — use autofill to complete manually',
+            apiFailure: apiFailure ? { code: apiFailure.code, message: apiFailure.message } : undefined,
+          },
+        },
+        400,
+      );
     } else {
-      return c.json({ error: { message: 'Login failed — check credentials' } }, 500);
+      const detail = apiFailure
+        ? `API: [${apiFailure.code}] ${apiFailure.message}. Browser: launch/login failed.`
+        : 'API and browser login both failed — check system logs (WAF / Chromium), not only credentials.';
+      return c.json({ error: { message: detail } }, 500);
     }
   } catch (err: any) {
     console.error('[Accounts] LOGIN failed:', err.message);
