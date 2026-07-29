@@ -347,7 +347,7 @@ if (import.meta.main) {
         await initAuth();
         logStore.log('info', 'boot', '[1/5] Accounts authenticated');
         for (const acct of getAccounts()) {
-          setStartupStatus(acct.email, 'pending');
+          setStartupStatus(acct.email, acct.state?.token && acct.state.expiresAt > Date.now() ? 'ready' : 'pending');
         }
       } catch (err: any) {
         logStore.log('warn', 'boot', `[1/5] initAuth failed: ${err.message}`);
@@ -356,7 +356,7 @@ if (import.meta.main) {
       // ── Phase 2b: Configure loaded accounts ──
       logStore.log('info', 'boot', '[2/5] Configuring accounts...');
       try {
-        const acctList = getAccounts().filter((a) => a.state?.token);
+        const acctList = getAccounts().filter((a) => a.state?.token && a.state.expiresAt > Date.now());
         for (const acct of acctList) {
           setStartupStatus(acct.email, 'ready');
           configureAccount(acct.email).catch((err: any) =>

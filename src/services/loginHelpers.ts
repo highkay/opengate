@@ -72,6 +72,7 @@ export interface LoginRetryOptions {
   baseDelayMs?: number;
   random?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  allowBrowserRecovery?: boolean;
 }
 
 /** Detect Aliyun WAF / challenge HTML masquerading as a 200. Exported for tests. */
@@ -318,6 +319,7 @@ export async function loginFreshViaBrowser(email: string, hashedPassword: string
 async function loginFreshViaFetchOnce(
   email: string,
   hashedPassword: string,
+  allowBrowserRecovery = true,
 ): Promise<{ state: AuthState | null; failure: LoginFailure | null }> {
   const { controller, cleanup } = createFetchTimeout();
   try {
@@ -335,6 +337,7 @@ async function loginFreshViaFetchOnce(
       body: JSON.stringify({ email, password: hashedPassword }),
       signal: controller.signal,
       accountEmail: email,
+      allowBrowserRecovery,
     });
 
     const contentType = response.headers.get('content-type');
@@ -464,7 +467,7 @@ export async function loginFreshViaFetch(
   const wait = retryOptions.sleep ?? sleep;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const { state, failure } = await loginFreshViaFetchOnce(email, hashedPassword);
+    const { state, failure } = await loginFreshViaFetchOnce(email, hashedPassword, retryOptions.allowBrowserRecovery);
     if (state) {
       clearLastLoginFailure(email);
       if (attempt > 1) {

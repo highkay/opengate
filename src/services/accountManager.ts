@@ -583,7 +583,7 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
   // Worst case for concurrent access: slightly imbalanced inFlight count,
   // which is acceptable for load-balancing purposes.
   try {
-    let available = accounts.filter((account) => !account.disabled && account.state && account.throttledUntil <= Date.now());
+    let available = accounts.filter(isAvailable);
     if (excludeEmail) {
       available = available.filter((a) => a.email !== excludeEmail);
     }

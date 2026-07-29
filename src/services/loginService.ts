@@ -12,6 +12,7 @@ import {
   clearLastLoginFailure,
   getLastLoginFailure,
   type LoginFailure,
+  type LoginRetryOptions,
   loginFreshViaBrowser,
   loginFreshViaFetch,
   loginViaTempContext,
@@ -23,13 +24,17 @@ export { clearLastLoginFailure, getLastLoginFailure, type LoginFailure };
 
 const loginMutex = new Mutex();
 
-export async function loginFresh(email: string, password: string): Promise<AuthState | null> {
+export interface LoginOptions extends LoginRetryOptions {
+  allowBrowserFallback?: boolean;
+}
+
+export async function loginFresh(email: string, password: string, options: LoginOptions = {}): Promise<AuthState | null> {
   beginLoginFailureScope(email);
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
 
   // Primary path: browserlessFetch (wreq + acw_tc + bx) — same transport as chat
   if (!process.env.TEST_MOCK_PLAYWRIGHT) {
-    const fetchResult = await loginFreshViaFetch(email, hashedPassword);
+    const fetchResult = await loginFreshViaFetch(email, hashedPassword, options);
     if (fetchResult) {
       logStore.log('info', 'auth', 'Login success (fetch): ' + email);
       return fetchResult;
@@ -37,7 +42,7 @@ export async function loginFresh(email: string, password: string): Promise<AuthS
   }
 
   // Fallback to browser strategies if fetch fails and a browser session exists
-  if (!process.env.TEST_MOCK_PLAYWRIGHT) {
+  if (!process.env.TEST_MOCK_PLAYWRIGHT && options.allowBrowserFallback !== false) {
     const activePage = getActivePage();
     if (activePage) {
       const browserResult = await loginFreshViaBrowser(email, hashedPassword, loginMutex);

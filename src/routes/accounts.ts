@@ -51,7 +51,7 @@ accountsRouter.get('/', (c) => {
   const masked = accounts.map((a) => ({
     email: a.email,
     passwordMasked: a.password ? '••••••••' : '',
-    authenticated: a.state !== null && a.state.token !== '',
+    authenticated: a.state !== null && a.state.token !== '' && a.state.expiresAt > Date.now(),
     tokenExpiresAt: a.state?.expiresAt || null,
     throttled: a.throttledUntil > Date.now(),
     throttledUntil: a.throttledUntil > Date.now() ? a.throttledUntil : null,

@@ -16,12 +16,13 @@ import {
 } from './browserRuntime.ts';
 import { logStore } from './logStore.ts';
 
-export function getProfileDir(email: string): string {
+export function getProfileDir(email: string, options: { create?: boolean } = {}): string {
   const safe = email
     .toLowerCase()
     .trim()
     .replace(/[^a-z0-9]/g, '_');
   const dir = projectPath('.qwen', 'browser-profiles', safe);
+  if (options.create === false) return dir;
   mkdirSync(dir, { recursive: true });
   // Set profile name to email so the Chrome window shows the account
   const prefsFile = `${dir}/Preferences`;

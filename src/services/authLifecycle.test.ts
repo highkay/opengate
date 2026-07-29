@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
 import type { AccountEntry, AuthState } from '../types/auth.ts';
 import { accounts, decrypt, loadAccountsFromFile, pickAccount, rebuildEmailIndex, reloadAccounts } from './accountManager.ts';
-import { authenticateAccountsAtStartup, saveCookies } from './auth.ts';
+import { authenticateAccountsAtStartup, loadCookiesFromProfile, saveCookies } from './auth.ts';
+import { getProfileDir } from './browserProfiles.ts';
 import { tryRefreshToken } from './tokenRefresh.ts';
 
 function account(email: string, password: string, state: AuthState | null = null): AccountEntry {
@@ -170,6 +171,33 @@ describe('authentication lifecycle persistence', () => {
     assert.equal(picked?.state?.token, 'fresh-token');
   });
 
+  test('pickAccount never refreshes an expired account before selecting a valid one', async () => {
+    let expiredRefreshTouched = false;
+    const expired = account('expired-with-password@example.com', 'stored-password', {
+      token: 'expired-token',
+      refreshToken: null,
+      expiresAt: Date.now() - 1,
+    });
+    expired.refreshInFlight = {
+      then(resolve: (value: boolean) => void) {
+        expiredRefreshTouched = true;
+        resolve(false);
+      },
+    } as Promise<boolean>;
+    const fresh = account('fresh-request@example.com', '', {
+      token: 'fresh-token',
+      refreshToken: null,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
+    accounts.push(expired, fresh);
+    rebuildEmailIndex();
+
+    const picked = await pickAccount();
+
+    assert.equal(picked?.email, fresh.email);
+    assert.equal(expiredRefreshTouched, false);
+  });
+
   test('startup authentication defaults to serial execution with jitter and failure backoff', async () => {
     const entries = [account('first@example.com', 'p1'), account('second@example.com', 'p2'), account('third@example.com', 'p3')];
     accounts.push(...entries);
@@ -208,6 +236,19 @@ describe('authentication lifecycle persistence', () => {
     assert.equal(entries[0].startupStatus, 'pending');
     assert.equal(entries[1].startupStatus, 'pending');
     assert.equal(entries[2].startupStatus, 'ready');
+  });
+
+  test('profile loading never creates an interactive browser profile implicitly', async () => {
+    const email = `missing-profile-${Date.now()}@example.com`;
+    const profileDir = getProfileDir(email, { create: false });
+    rmSync(profileDir, { recursive: true, force: true });
+    accounts.push(account(email, 'stored-password'));
+    rebuildEmailIndex();
+
+    const state = await loadCookiesFromProfile(email);
+
+    assert.equal(state, null);
+    assert.equal(existsSync(profileDir), false);
   });
 
   test('refresh success immediately persists new token, refresh token, and expiry', async () => {

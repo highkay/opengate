@@ -7,7 +7,7 @@
 import type { AccountEntry } from '../types/auth.ts';
 import { getAuthRefreshBeforeMs, saveCookies } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
-import { loginFresh } from './loginService.ts';
+import { type LoginOptions, loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 
 export function needsRefresh(acct: AccountEntry): boolean {
@@ -40,7 +40,7 @@ export async function tryRefreshToken(acct: AccountEntry, fetcher: typeof browse
   }
 }
 
-export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
+export async function ensureAccountFresh(acct: AccountEntry, loginOptions: LoginOptions = {}): Promise<boolean> {
   if (acct.state && !needsRefresh(acct)) {
     acct.startupStatus = 'ready';
     return true;
@@ -71,7 +71,7 @@ export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
         return false;
       }
 
-      const newState = await loginFresh(acct.email, acct.password);
+      const newState = await loginFresh(acct.email, acct.password, loginOptions);
       if (newState) {
         await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
         return true;

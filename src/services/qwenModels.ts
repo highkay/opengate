@@ -1,12 +1,12 @@
-import { decrementInFlight, getAllAccountEmails, getTokenWithAccount } from './auth.ts';
+import modelsConfig from '../models.json' with { type: 'json' };
+import { getAllAccountEmails, getTokenWithAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { DEFAULT_SYSTEM_PROMPT } from './defaultSystemPrompt.ts';
 import { logStore } from './logStore.ts';
 import { COMPAT_MODEL_ALIASES } from './modelRouter.ts';
 import { completeEntry, errorEntry } from './networkDebug.ts';
-import { getBasicHeaders } from './playwright.ts';
-import { QWEN_API_BASE, QWEN_CHATS_URL, QWEN_MODELS_URL, QWEN_SETTINGS_URL } from './qwen.ts';
+import { QWEN_API_BASE, QWEN_CHATS_URL, QWEN_SETTINGS_URL } from './qwen.ts';
 
 export { DEFAULT_SYSTEM_PROMPT };
 
@@ -33,10 +33,54 @@ async function postQwenSettings(
   return { response, debugId: 'browserless-' + Date.now() };
 }
 
-let cachedModels: any[] | null = null;
-let lastModelsFetch = 0;
 let customInstructionApplied = false;
 let applyingCustomInstructionInProgress: Promise<void> | null = null;
+
+interface LocalModelConfig {
+  max_context: number;
+  max_output: number;
+  modalities: string[];
+}
+
+function normalizeCatalogModelId(modelId: string): string {
+  return modelId.replace(/^qwen([23])-(\d)-/, 'qwen$1.$2-');
+}
+
+function buildLocalModelCatalog(): any[] {
+  const created = Math.floor(Date.now() / 1000);
+  const models = new Map<string, any>();
+  for (const [configuredId, rawConfig] of Object.entries(modelsConfig)) {
+    const modelConfig = rawConfig as LocalModelConfig;
+    const id = normalizeCatalogModelId(configuredId);
+    models.set(id, {
+      id,
+      object: 'model',
+      created,
+      owned_by: 'qwen',
+      context_window: modelConfig.max_context,
+      max_output_tokens: modelConfig.max_output,
+      modalities: modelConfig.modalities,
+      description: '',
+      capabilities: {},
+    });
+  }
+  for (const [alias, target] of Object.entries(COMPAT_MODEL_ALIASES)) {
+    const base = models.get(target) || {
+      object: 'model',
+      created,
+      owned_by: 'qwen',
+      context_window: 250000,
+      max_output_tokens: 65000,
+      modalities: ['text'],
+      description: '',
+      capabilities: {},
+    };
+    models.set(alias, { ...base, id: alias, owned_by: 'qwen2api-compat', base_model: target });
+  }
+  return [...models.values()];
+}
+
+const localModelCatalog = buildLocalModelCatalog();
 
 export async function setCustomInstruction(instruction: string): Promise<void> {
   if (!instruction || instruction.trim().length === 0) return;
@@ -161,83 +205,5 @@ export async function deleteAllChats(email: string): Promise<void> {
 }
 
 export async function fetchQwenModels(): Promise<any[]> {
-  const now = Date.now();
-  const cacheTtl = config.getInt('MODELS_CACHE_TTL_MS', 3600000);
-  if (cachedModels && now - lastModelsFetch < cacheTtl) {
-    return cachedModels;
-  }
-
-  const { email: resolvedEmail } = await getBasicHeaders();
-  if (resolvedEmail) decrementInFlight(resolvedEmail);
-
-  const tokenInfo = resolvedEmail ? await getTokenWithAccount(resolvedEmail) : null;
-  const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-
-  let lastErr: Error | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt));
-
-      const response = await browserlessFetch(QWEN_MODELS_URL, {
-        method: 'GET',
-        headers: {
-          accept: 'application/json, text/plain, */*',
-          source: 'web',
-          origin: QWEN_API_BASE,
-          referer: 'https://chat.qwen.ai/',
-          ...(cookieStr ? { cookie: cookieStr } : {}),
-        },
-        accountEmail: resolvedEmail,
-      });
-
-      if (!response.ok) throw new Error(`Failed to fetch models from Qwen: ${response.status} ${response.statusText}`);
-
-      const json = JSON.parse(await response.text());
-      if (!json.data || !Array.isArray(json.data)) {
-        logStore.log('debug', 'qwen', `[Qwen] fetchQwenModels: response missing data array, returning cached or empty`);
-        return cachedModels || [];
-      }
-
-      const models = json.data.map((m: any) => ({
-        id: m.id,
-        object: 'model',
-        created: m.info?.created_at || Math.floor(Date.now() / 1000),
-        owned_by: m.owned_by || 'qwen',
-        context_window: m.info?.meta?.max_context_length ?? 1000000,
-        max_output_tokens: m.info?.meta?.max_summary_generation_length ?? 65536,
-        modalities: m.info?.meta?.modality ?? ['text'],
-        description: m.info?.meta?.short_description || m.info?.meta?.description || '',
-        capabilities: m.info?.meta?.capabilities || {},
-      }));
-      const byId = new Map(models.map((m: any) => [m.id, m]));
-      for (const [alias, target] of Object.entries(COMPAT_MODEL_ALIASES)) {
-        if (byId.has(alias)) continue;
-        const base = byId.get(target) || {
-          object: 'model',
-          created: Math.floor(Date.now() / 1000),
-          owned_by: 'qwen',
-          context_window: 250000,
-          max_output_tokens: 65000,
-          modalities: ['text'],
-          description: '',
-          capabilities: {},
-        };
-        models.push({
-          ...base,
-          id: alias,
-          owned_by: 'qwen2api-compat',
-          base_model: target,
-        });
-      }
-
-      cachedModels = models;
-      lastModelsFetch = now;
-      return models;
-    } catch (err: any) {
-      lastErr = err;
-    }
-  }
-
-  console.error(`[Qwen] fetchQwenModels failed after 3 attempts:`, lastErr?.message);
-  return cachedModels || [];
+  return localModelCatalog;
 }

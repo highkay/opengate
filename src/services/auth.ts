@@ -85,6 +85,14 @@ interface StartupAuthOptions {
   random?: () => number;
 }
 
+function getStartupLoginOptions() {
+  return {
+    maxAttempts: Math.max(1, Math.floor(getEnvNumber('AUTH_STARTUP_LOGIN_ATTEMPTS', 1))),
+    allowBrowserRecovery: false,
+    allowBrowserFallback: false,
+  };
+}
+
 function getEnvNumber(name: string, fallback: number): number {
   const parsed = Number(process.env[name]);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
@@ -226,10 +234,11 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   rebuildEmailIndex();
 
   try {
+    const startupLoginOptions = getStartupLoginOptions();
     const persistedAccounts = accounts.filter((acct) => acct.state && needsRefresh(acct));
     await runStartupTasks(persistedAccounts, async (acct) => {
       acct.startupStatus = 'connecting';
-      const fresh = await ensureAccountFresh(acct);
+      const fresh = await ensureAccountFresh(acct, startupLoginOptions);
       acct.startupStatus = fresh ? 'ready' : 'pending';
       return fresh;
     });
@@ -256,7 +265,9 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
     if (needLogin.length > 0) {
       const concurrency = Math.max(1, Math.floor(getEnvNumber('AUTH_STARTUP_CONCURRENCY', 1)));
       logStore.log('info', 'auth', `Logging in ${needLogin.length} accounts (max ${concurrency} concurrent)...`);
-      await authenticateAccountsAtStartup(needLogin);
+      await authenticateAccountsAtStartup(needLogin, {
+        login: (email, password) => loginFresh(email, password, startupLoginOptions),
+      });
     }
 
     // Phase 3: Run post-login callbacks in parallel
@@ -297,37 +308,24 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
   let context: any = null;
   try {
     const { getProfileDir } = await import('./playwright.ts');
-    const profileDir = getProfileDir(email);
+    const profileDir = getProfileDir(email, { create: false });
     const acct = accounts.find((a) => a.email.toLowerCase().trim() === email.toLowerCase().trim());
-    const password = acct?.password;
 
     if (!existsSync(join(profileDir, 'Default', 'Cookies'))) {
-      logStore.log('warn', 'auth', `No profile dir for ${email} — creating via browser login...`);
-      if (password) {
-        const { openBrowserProfile } = await import('./browserProfiles.ts');
-        let result = await openBrowserProfile(email, password, { headless: true });
-        if (result === 'captcha') {
-          logStore.log('info', 'auth', `Captcha for ${email} — opening headed browser for manual login...`);
-          result = await openBrowserProfile(email, password, { headless: false });
-        }
-        if (result === 'success') {
-          logStore.log('info', 'auth', `✓ Profile created for ${email} via browser login`);
-          if (acct?.state) return acct.state;
-        } else {
-          logStore.log('warn', 'auth', `Profile creation failed for ${email}: ${result}`);
-        }
-      }
+      logStore.log('debug', 'auth', `No existing browser profile for ${email}; manual login remains available from the dashboard`);
       return null;
     }
 
     logStore.log('info', 'auth', `Loading token from profile for ${email}...`);
     const { BROWSER_DEFAULT_ARGS } = await import('./playwright.ts');
-    const { launchPersistentContext } = await import('cloakbrowser');
+    const { launchPersistentBrowserContext } = await import('./browserRuntime.ts');
     const PROFILE_LAUNCH_TIMEOUT_MS = 30_000;
     context = await Promise.race([
-      launchPersistentContext({
+      launchPersistentBrowserContext({
         userDataDir: profileDir,
         headless: true,
+        humanize: true,
+        geoip: true,
         args: [...BROWSER_DEFAULT_ARGS],
       }),
       new Promise<never>((_, reject) =>
@@ -336,43 +334,12 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
     ]);
 
     try {
-      let cookies = await context.cookies();
-      let authCookie = cookies.find((c: Cookie) => {
+      const cookies = await context.cookies();
+      const authCookie = cookies.find((c: Cookie) => {
         const n = c.name.toLowerCase();
         if (n.includes('refresh')) return false;
         return n.includes('token') || n.includes('session');
       });
-
-      // No auth cookie — authorize the profile via openBrowserProfile
-      if (!authCookie?.value && password) {
-        logStore.log('info', 'auth', `Authorizing profile for ${email}...`);
-        try {
-          await context.close();
-          context = null;
-        } catch {
-          /* non-blocking */
-        }
-
-        const { openBrowserProfile } = await import('./browserProfiles.ts');
-        let result = await openBrowserProfile(email, password, { headless: true });
-        if (result === 'captcha') {
-          logStore.log('info', 'auth', `Captcha for ${email} — opening headed browser for manual login...`);
-          result = await openBrowserProfile(email, password, { headless: false });
-        }
-
-        if (result === 'success') {
-          const updated = accounts.find((a) => a.email.toLowerCase().trim() === email.toLowerCase().trim());
-          if (updated?.state) {
-            logStore.log('info', 'auth', `✓ Authorized ${email} via browser profile`);
-            return updated.state;
-          }
-          logStore.log('warn', 'auth', `Profile auth succeeded but no state for ${email}, letting caller retry`);
-          return null;
-        } else {
-          logStore.log('warn', 'auth', `Profile authorization failed for ${email}: ${result}`);
-          return null;
-        }
-      }
 
       // Save ALL cookies as profileCookies regardless of JWT health.
       // The baxia/WAF cookies (cna, ssxmod_itna, tfstk, isg) are independent
@@ -409,7 +376,7 @@ export async function loadCookiesFromProfile(email: string): Promise<AuthState |
         } else {
           logStore.log('warn', 'auth', `Token expired for ${email}`);
         }
-      } else if (!authCookie?.value && password) {
+      } else {
         logStore.log('warn', 'auth', `No auth cookie found in profile for ${email}`);
       }
     } finally {

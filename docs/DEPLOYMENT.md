@@ -74,7 +74,8 @@ services:
       AUTH_STARTUP_BACKOFF_MS: "3000"
       AUTH_STARTUP_JITTER_MS: "3000"
       AUTH_STARTUP_BACKOFF_MULTIPLIER: "2"
-      AUTH_STARTUP_MAX_BACKOFF_MS: "60000"
+      AUTH_STARTUP_MAX_BACKOFF_MS: "15000"
+      AUTH_STARTUP_LOGIN_ATTEMPTS: "1"
     ports:
       - "7860:7860"
     shm_size: "1gb"
@@ -133,7 +134,8 @@ Then open `http://127.0.0.1:7900/vnc.html?autoconnect=true&resize=remote`, enter
 - On first write, `.qwen/master.key` is created with mode `0600`. Existing installations seed it from the current `API_KEY`, so later API key rotation does not make stored account passwords undecryptable.
 - Token, refresh token, expiry, password migration, and throttle state use atomic file replacement.
 - Keep `.qwen/master.key`, `.qwen/accounts.json`, and browser profiles together in backups. Losing `master.key` makes encrypted passwords unrecoverable.
-- Startup authentication is serialized by default to reduce WAF amplification. The `AUTH_STARTUP_*` variables above control concurrency, backoff, jitter, multiplier, and maximum delay.
+- Startup authentication is serialized and uses one HTTP-only sign-in attempt per account by default. It never opens an interactive browser or Playwright WAF recovery during boot; CAPTCHA/browser login is started only by an explicit dashboard login job. The `AUTH_STARTUP_*` variables above control concurrency, retry count, backoff, jitter, multiplier, and maximum delay.
+- `/v1/models` is generated from the bundled model catalog and compatibility aliases. It does not contact Qwen, consume an account, or start browser-based WAF recovery.
 
 ### Update instance to a new release
 

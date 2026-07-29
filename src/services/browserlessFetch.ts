@@ -34,6 +34,8 @@ export interface BrowserlessFetchOptions {
   body?: string;
   accountEmail?: string;
   signal?: AbortSignal;
+  /** Allow Playwright cookie recovery after HTTP-only WAF recovery fails. Default true. */
+  allowBrowserRecovery?: boolean;
   /** Keep the session alive for streaming. Default false — session is closed after response. */
   stream?: boolean;
 }
@@ -134,7 +136,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     return globalThis.fetch(url, { method, headers, body });
   }
 
-  const { method = 'GET', headers = {}, body, accountEmail, signal, stream } = options;
+  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true } = options;
 
   // Auto-inject bx tokens
   await ensureBxUmidtoken(headers);
@@ -209,6 +211,9 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       }
 
       if (needsBrowserRefresh) {
+        if (!allowBrowserRecovery) {
+          throw new Error(`WAF challenge persists after HTTP cookie refresh for ${url.split('?')[0]}; browser recovery disabled`);
+        }
         logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
         const key = accountEmail || '_default_';
         let promise = cookieRefreshInFlight.get(key);
