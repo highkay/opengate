@@ -4,7 +4,14 @@ import { logStore } from './logStore.ts';
 import { QWEN_BX_V } from './qwen.ts';
 
 export type { BrowserProfileOptions, LoginResult } from './browserProfiles.ts';
-export { BROWSER_DEFAULT_ARGS, getProfileDir, openBrowserProfile, refreshViaProfile } from './browserProfiles.ts';
+export {
+  BROWSER_DEFAULT_ARGS,
+  closeManualBrowserProfile,
+  getProfileDir,
+  openBrowserProfile,
+  pollManualBrowserProfile,
+  refreshViaProfile,
+} from './browserProfiles.ts';
 
 export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
 export interface AccountContext {

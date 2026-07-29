@@ -2,7 +2,7 @@ import type { AuthState } from '../types/auth.ts';
 import { getAccountByEmail, loadCookiesFromProfile, saveCookies, setStartupStatus } from './auth.ts';
 import { getLastLoginFailure, type LoginFailure, loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
-import { openBrowserProfile } from './playwright.ts';
+import { closeManualBrowserProfile, openBrowserProfile, pollManualBrowserProfile } from './playwright.ts';
 
 export type LoginJobStatus = 'queued' | 'api_login' | 'browser_login' | 'captcha' | 'awaiting_manual' | 'authenticated' | 'failed';
 
@@ -49,6 +49,8 @@ interface LoginJobDependencies {
   getAccount: (email: string) => LoginAccount | null;
   apiLogin: (email: string, password: string) => Promise<{ state: AuthState | null; failure: LoginFailure | null }>;
   browserLogin: (email: string, password: string, headless: boolean) => Promise<BrowserLoginResult>;
+  pollManualBrowser: (email: string) => Promise<'success' | 'captcha' | 'closed'>;
+  closeManualBrowser: (email: string) => Promise<void>;
   loadProfileState: (email: string) => Promise<AuthState | null>;
   saveState: (email: string, state: AuthState) => Promise<void>;
   setStartupStatus: (email: string, status: 'pending' | 'connecting' | 'ready') => void;
@@ -398,16 +400,31 @@ export class LoginJobManager {
 
     const deadline = Math.min(job.expiresAt, this.dependencies.now() + this.options.manualWaitMs);
     while (this.dependencies.now() < deadline) {
-      await this.dependencies.sleep(this.options.manualPollIntervalMs);
       const current = this.jobs.get(jobId);
       if (!current || TERMINAL_STATUSES.has(current.status)) return;
+      const browserResult = await this.dependencies.pollManualBrowser(job.email);
+      if (browserResult === 'success') {
+        await this.confirmBrowserAuthentication(jobId);
+        return;
+      }
+      if (browserResult === 'closed') {
+        this.fail(jobId, {
+          stage: 'browser',
+          code: 'browser_closed',
+          message: 'Interactive browser closed before authentication completed.',
+          retryable: true,
+        });
+        return;
+      }
       const state = this.dependencies.getAccount(job.email)?.state;
       if (state?.token) {
         this.authenticate(jobId, 'browser', 'Manual browser login completed.');
         return;
       }
+      await this.dependencies.sleep(this.options.manualPollIntervalMs);
     }
 
+    await this.closeManualBrowser(job.email);
     this.fail(jobId, {
       stage: 'browser',
       code: 'manual_timeout',
@@ -420,6 +437,7 @@ export class LoginJobManager {
     const job = this.jobs.get(jobId);
     if (!job || TERMINAL_STATUSES.has(job.status)) return;
     this.safeSetStartupStatus(job.email, 'ready');
+    void this.closeManualBrowser(job.email);
     this.update(jobId, { status: 'authenticated', method, message, failure: undefined });
     this.dependencies.log('info', `Login job ${job.id} authenticated ${job.email} via ${method}.`);
   }
@@ -428,6 +446,7 @@ export class LoginJobManager {
     const job = this.jobs.get(jobId);
     if (!job || TERMINAL_STATUSES.has(job.status)) return;
     this.safeSetStartupStatus(job.email, 'pending');
+    void this.closeManualBrowser(job.email);
     this.update(jobId, { status: 'failed', message: failure.message, failure });
     this.dependencies.log('warn', `Login job ${job.id} failed for ${job.email} [${failure.code}]: ${failure.message}`);
   }
@@ -449,6 +468,14 @@ export class LoginJobManager {
       this.dependencies.log('warn', `Failed to set startup status for ${email}: ${sanitizeMessage(error)}`);
     }
   }
+
+  private async closeManualBrowser(email: string): Promise<void> {
+    try {
+      await this.dependencies.closeManualBrowser(email);
+    } catch (error) {
+      this.dependencies.log('warn', `Failed to close manual browser for ${email}: ${sanitizeMessage(error)}`);
+    }
+  }
 }
 
 const defaultDependencies: LoginJobDependencies = {
@@ -461,6 +488,8 @@ const defaultDependencies: LoginJobDependencies = {
     return { state, failure: state ? null : getFailure(email) };
   },
   browserLogin: (email, password, headless) => openBrowserProfile(email, password, { headless }),
+  pollManualBrowser: (email) => pollManualBrowserProfile(email),
+  closeManualBrowser: (email) => closeManualBrowserProfile(email),
   loadProfileState: (email) => loadCookiesFromProfile(email),
   saveState: (email, state) => saveCookies(email, state.token, state.refreshToken, state.expiresAt),
   setStartupStatus,

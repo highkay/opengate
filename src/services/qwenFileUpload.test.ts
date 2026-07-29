@@ -116,7 +116,7 @@ describe('parseStsTokenResponse', () => {
     // HTTP 200 + data present but all STS fields missing → previously crashed in uploadToOss
     assert.throws(
       () => parseStsTokenResponse({ success: false, data: { code: 'RateLimited', details: 'limit', num: 20 } }, 'x@qwen'),
-      (e: any) => e instanceof StsTokenError && !('file_path' in (e as any) && e.file_path),
+      (error: unknown) => error instanceof StsTokenError && !('file_path' in error),
     );
   });
 });

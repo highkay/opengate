@@ -70,8 +70,14 @@ services:
       PORT: "7860"
       HOST: "0.0.0.0"
       NODE_ENV: production
+      AUTH_STARTUP_CONCURRENCY: "1"
+      AUTH_STARTUP_BACKOFF_MS: "3000"
+      AUTH_STARTUP_JITTER_MS: "3000"
+      AUTH_STARTUP_BACKOFF_MULTIPLIER: "2"
+      AUTH_STARTUP_MAX_BACKOFF_MS: "60000"
     ports:
       - "7860:7860"
+    shm_size: "1gb"
     volumes:
       - ./.qwen:/app/.qwen
       - ./config.json:/app/config.json
@@ -83,6 +89,51 @@ services:
       start_period: 15s
       retries: 3
 ```
+
+### Browser-assisted login recovery
+
+API login remains the primary path. When Qwen requires CAPTCHA or interactive verification, the container can open a persistent Chromium profile and expose an authenticated noVNC console on loopback only.
+
+Add the following deployment settings:
+
+```yaml
+services:
+  qwen2api:
+    env_file:
+      - ./.browser.env
+    environment:
+      MANUAL_BROWSER_ENABLED: "true"
+      BROWSER_MANUAL_URL: "http://127.0.0.1:7900/vnc.html?autoconnect=true&resize=remote"
+    ports:
+      - "7860:7860"
+      - "127.0.0.1:7900:7900"
+    shm_size: "1gb"
+```
+
+Create the secret file without committing it:
+
+```bash
+umask 077
+printf 'BROWSER_VNC_PASSWORD=%s\n' "$(openssl rand -base64 24)" > .browser.env
+```
+
+Access the console through an SSH tunnel instead of exposing it publicly:
+
+```bash
+ssh -L 7900:127.0.0.1:7900 user@server
+```
+
+Then open `http://127.0.0.1:7900/vnc.html?autoconnect=true&resize=remote`, enter the password from `.browser.env`, and complete the login or CAPTCHA. The login job polls the persistent browser cookies, saves the resulting token atomically, marks the account ready, and closes the browser context. Failed, expired, or timed-out jobs also close their context.
+
+`MANUAL_BROWSER_ENABLED` is disabled by default. Enabling it without `BROWSER_VNC_PASSWORD` makes the container refuse to start, preventing an unauthenticated browser console.
+
+### Authentication persistence
+
+- Passwords are stored with AES-256-GCM in `.qwen/accounts.json`.
+- On first write, `.qwen/master.key` is created with mode `0600`. Existing installations seed it from the current `API_KEY`, so later API key rotation does not make stored account passwords undecryptable.
+- Token, refresh token, expiry, password migration, and throttle state use atomic file replacement.
+- Keep `.qwen/master.key`, `.qwen/accounts.json`, and browser profiles together in backups. Losing `master.key` makes encrypted passwords unrecoverable.
+- Startup authentication is serialized by default to reduce WAF amplification. The `AUTH_STARTUP_*` variables above control concurrency, backoff, jitter, multiplier, and maximum delay.
 
 ### Update instance to a new release
 

@@ -74,6 +74,10 @@ async function setupBrowserContext(email: string, headless: boolean): Promise<an
 
 const manualProfileContexts = new Map<string, any>();
 
+function manualContextKey(email: string): string {
+  return email.toLowerCase().trim();
+}
+
 async function closeContext(context: any, email: string, reason: string): Promise<void> {
   try {
     await context.close();
@@ -197,15 +201,16 @@ export async function openBrowserProfile(email: string, password?: string, optio
     }
   }
 
-  const existingManualContext = manualProfileContexts.get(email);
+  const contextKey = manualContextKey(email);
+  const existingManualContext = manualProfileContexts.get(contextKey);
   if (existingManualContext) {
     const existingResult = await tryCheckToken(existingManualContext, email);
     if (existingResult === 'success') {
-      manualProfileContexts.delete(email);
+      manualProfileContexts.delete(contextKey);
       return existingResult;
     }
     if (existingResult !== 'closed') return 'captcha';
-    manualProfileContexts.delete(email);
+    manualProfileContexts.delete(contextKey);
   }
 
   let context: any = null;
@@ -242,13 +247,13 @@ export async function openBrowserProfile(email: string, password?: string, optio
         );
         try {
           const disposition = await prepareCaptchaHandoff(context, headless);
-          if (disposition === 'keep_open') manualProfileContexts.set(email, context);
+          if (disposition === 'keep_open') manualProfileContexts.set(contextKey, context);
         } catch {
           logStore.log('warn', 'browser', `context.close failed before headed CAPTCHA handoff for ${email}`);
         }
         return 'captcha';
       }
-      manualProfileContexts.delete(email);
+      manualProfileContexts.delete(contextKey);
       logStore.log('info', 'browser', `✓ Login successful for ${email}`);
       return result;
     }
@@ -271,6 +276,27 @@ export async function openBrowserProfile(email: string, password?: string, optio
     }
     return 'error';
   }
+}
+
+export async function pollManualBrowserProfile(email: string): Promise<'success' | 'captcha' | 'closed'> {
+  const contextKey = manualContextKey(email);
+  const context = manualProfileContexts.get(contextKey);
+  if (!context) return 'closed';
+
+  const result = await tryCheckToken(context, email);
+  if (result === 'success' || result === 'closed') {
+    manualProfileContexts.delete(contextKey);
+    return result;
+  }
+  return 'captcha';
+}
+
+export async function closeManualBrowserProfile(email: string): Promise<void> {
+  const contextKey = manualContextKey(email);
+  const context = manualProfileContexts.get(contextKey);
+  if (!context) return;
+  manualProfileContexts.delete(contextKey);
+  await closeContext(context, email, 'while closing manual login');
 }
 
 export async function refreshViaProfile(email: string): Promise<boolean> {

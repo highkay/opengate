@@ -42,7 +42,7 @@ export async function loginFresh(email: string, password: string): Promise<AuthS
     if (activePage) {
       const browserResult = await loginFreshViaBrowser(email, hashedPassword, loginMutex);
       if (browserResult) {
-        clearLastLoginFailure();
+        clearLastLoginFailure(email);
         logStore.log('info', 'auth', 'Login success: ' + email);
         return browserResult;
       }
@@ -53,7 +53,7 @@ export async function loginFresh(email: string, password: string): Promise<AuthS
     if (browser) {
       const tempResult = await loginViaTempContext(browser, email, hashedPassword, loginMutex);
       if (tempResult) {
-        clearLastLoginFailure();
+        clearLastLoginFailure(email);
         logStore.log('info', 'auth', 'Login success (temp context): ' + email);
         return tempResult;
       }
@@ -61,7 +61,7 @@ export async function loginFresh(email: string, password: string): Promise<AuthS
     }
   }
 
-  const failure = getLastLoginFailure();
+  const failure = getLastLoginFailure(email);
   if (failure) {
     logStore.log('error', 'auth', `Login failed: ${email} [${failure.code}] ${failure.message}`);
   } else {

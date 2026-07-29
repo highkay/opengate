@@ -85,6 +85,20 @@ describe('authentication lifecycle persistence', () => {
     );
   });
 
+  test('persists the initial API key so encrypted passwords survive API key rotation', async () => {
+    const entry = account('rotation@example.com', 'rotation-secret');
+    accounts.push(entry);
+    rebuildEmailIndex();
+
+    await saveCookies(entry.email, 'rotation-token', null, Date.now() + 60_000);
+
+    const persisted = JSON.parse(readFileSync(join(dataDir, 'accounts.json'), 'utf-8'))[0];
+    assert.equal(readFileSync(join(dataDir, 'master.key'), 'utf-8'), 'auth-lifecycle-test-key');
+
+    process.env.API_KEY = 'rotated-api-key';
+    assert.equal(decrypt(persisted.password), 'rotation-secret');
+  });
+
   test('loadAccountsFromFile migrates legacy plaintext passwords', () => {
     writeFileSync(
       join(dataDir, 'accounts.json'),

@@ -17,7 +17,7 @@ function createHarness(overrides: Record<string, unknown> = {}) {
     password: 'secret-password',
     state: null as AuthState | null,
   };
-  const calls = { api: 0, browser: [] as boolean[] };
+  const calls = { api: 0, browser: [] as boolean[], manualPoll: 0, manualClose: 0 };
   const dependencies = {
     now: () => now,
     createId: () => `job-${++id}`,
@@ -29,6 +29,13 @@ function createHarness(overrides: Record<string, unknown> = {}) {
     browserLogin: async (_email: string, _password: string, headless: boolean) => {
       calls.browser.push(headless);
       return 'success' as const;
+    },
+    pollManualBrowser: async () => {
+      calls.manualPoll += 1;
+      return 'captcha' as const;
+    },
+    closeManualBrowser: async () => {
+      calls.manualClose += 1;
     },
     loadProfileState: async () => account.state,
     saveState: async (_email: string, state: AuthState) => {
@@ -123,8 +130,9 @@ describe('LoginJobManager', () => {
     expect(completed?.failure?.code).toBe('browser_unavailable');
   });
 
-  test('reports CAPTCHA and completes when manual login saves account state', async () => {
+  test('reports CAPTCHA and completes when the manual browser yields a token', async () => {
     let browserCalls = 0;
+    let manualPolls = 0;
     const harness = createHarness({
       apiLogin: async () => ({
         state: null,
@@ -134,8 +142,11 @@ describe('LoginJobManager', () => {
         browserCalls += 1;
         return 'captcha' as const;
       },
-      sleep: async () => {
+      pollManualBrowser: async () => {
+        manualPolls += 1;
+        if (manualPolls === 1) return 'captcha' as const;
         harness.account.state = TOKEN_STATE;
+        return 'success' as const;
       },
     });
 
@@ -147,6 +158,8 @@ describe('LoginJobManager', () => {
     expect(completed?.method).toBe('browser');
     expect(completed?.manualUrl).toBe('https://manual.example.test/login');
     expect(harness.startupStatuses).toContain('ready');
+    expect(manualPolls).toBe(2);
+    expect(harness.calls.manualClose).toBeGreaterThanOrEqual(1);
   });
 
   test('reuses one active task per normalized account', async () => {

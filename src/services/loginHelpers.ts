@@ -466,7 +466,7 @@ export async function loginFreshViaFetch(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const { state, failure } = await loginFreshViaFetchOnce(email, hashedPassword);
     if (state) {
-      clearLastLoginFailure();
+      clearLastLoginFailure(email);
       if (attempt > 1) {
         logStore.log('info', 'auth', `API login succeeded for ${email} on attempt ${attempt}/${maxAttempts}`);
       }

@@ -151,19 +151,21 @@ function getEncryptionKey(): string {
     // Fall through to other strategies
   }
 
-  // 2. Use API_KEY as encryption key (backward compatibility)
+  // 2. Persist the current API_KEY as the stable master key for backward compatibility.
+  // Existing encrypted passwords were derived from API_KEY, so the first master.key
+  // must use the same material before API_KEY can be rotated safely.
   const apiKey = config.get('API_KEY');
-  if (apiKey) return apiKey;
-
-  // 3. Generate a persistent master key on first use
+  const keyMaterial = apiKey || crypto.randomBytes(32).toString('hex');
   try {
     const dir = path.dirname(masterKeyFile);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    const newKey = crypto.randomBytes(32).toString('hex');
-    writeFileSync(masterKeyFile, newKey, { encoding: 'utf-8', mode: 0o600 });
-    return newKey;
+    writeFileSync(masterKeyFile, keyMaterial, { encoding: 'utf-8', mode: 0o600 });
+    return keyMaterial;
   } catch {
-    // 4. Fallback: hostname-based key (only when filesystem is unwritable)
+    // 3. Preserve compatibility when the key directory is temporarily unwritable.
+    if (apiKey) return apiKey;
+
+    // 4. Last resort for installations without API_KEY and writable persistence.
     const machineId = `${os.hostname()}-${projectPath('.')}`;
     return crypto.createHash('sha256').update(machineId).digest('hex');
   }
@@ -354,7 +356,7 @@ export async function addAccount(email: string, password: string): Promise<{ log
     return { loginSucceeded: true };
   }
 
-  const apiFailure = getLastLoginFailure();
+  const apiFailure = getLastLoginFailure(normalizedEmail);
   logStore.log(
     'warn',
     'account',
