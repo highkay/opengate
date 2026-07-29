@@ -202,11 +202,14 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         const err =
           primary instanceof StsTokenError
             ? primary
-            : Object.assign(new Error(`Failed to upload images — none of the image files could be uploaded: ${primary?.message || 'unknown'}`), {
-                cause: primary,
-                upstreamStatus: primary?.upstreamStatus,
-                code: primary?.code,
-              });
+            : Object.assign(
+                new Error(`Failed to upload images — none of the image files could be uploaded: ${primary?.message || 'unknown'}`),
+                {
+                  cause: primary,
+                  upstreamStatus: primary?.upstreamStatus,
+                  code: primary?.code,
+                },
+              );
         lastFailedEmail = accountEmail;
         lastError = err;
         decrementInFlight(accountEmail);
@@ -234,11 +237,14 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         const err =
           primary instanceof StsTokenError
             ? primary
-            : Object.assign(new Error(`Failed to upload videos — none of the video files could be uploaded: ${primary?.message || 'unknown'}`), {
-                cause: primary,
-                upstreamStatus: primary?.upstreamStatus,
-                code: primary?.code,
-              });
+            : Object.assign(
+                new Error(`Failed to upload videos — none of the video files could be uploaded: ${primary?.message || 'unknown'}`),
+                {
+                  cause: primary,
+                  upstreamStatus: primary?.upstreamStatus,
+                  code: primary?.code,
+                },
+              );
         lastFailedEmail = accountEmail;
         lastError = err;
         decrementInFlight(accountEmail);

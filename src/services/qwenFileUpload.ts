@@ -84,19 +84,10 @@ export function parseStsTokenResponse(resData: any, email: string): StsTokenResp
       // Use full duration from Qwen (same as chat stream RateLimited handling) — do not cap.
       const throttleMs = (retryHours || 1) * 3600_000;
       throttleAccount(email, throttleMs);
-      logStore.log(
-        'warn',
-        'upload',
-        `[FileUpload] getstsToken RateLimited for ${email} — throttled ${retryHours || 1}h: ${details}`,
-      );
+      logStore.log('warn', 'upload', `[FileUpload] getstsToken RateLimited for ${email} — throttled ${retryHours || 1}h: ${details}`);
     }
 
-    throw new StsTokenError(
-      `getstsToken failed: ${code} — ${details}.${wait}`,
-      code,
-      code === 'RateLimited' ? 429 : 502,
-      retryHours,
-    );
+    throw new StsTokenError(`getstsToken failed: ${code} — ${details}.${wait}`, code, code === 'RateLimited' ? 429 : 502, retryHours);
   }
 
   return resData.data;

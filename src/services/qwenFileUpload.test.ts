@@ -1,5 +1,5 @@
-import assert from 'node:assert';
 import { afterEach, describe, test } from 'bun:test';
+import assert from 'node:assert';
 import { accounts, rebuildEmailIndex } from './accountManager.ts';
 import { isAccountThrottled } from './auth.ts';
 import { parseStsTokenResponse, StsTokenError } from './qwenFileUpload.ts';
