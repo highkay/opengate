@@ -33,8 +33,83 @@ function setError(msg) {
   }
 }
 
+var activeLoginJobs = {};
+var activePollTimers = {};
+var manualNotifications = {};
+
+function isActiveLoginStatus(status) {
+  return (
+    status === 'queued' || status === 'api_login' || status === 'browser_login' || status === 'captcha' || status === 'awaiting_manual'
+  );
+}
+
+function getLoginJob(email) {
+  return activeLoginJobs[String(email || '').toLowerCase()] || null;
+}
+
+function setLoginJobNotice(email, job) {
+  var box = document.getElementById('loginJobBox');
+  if (!box) return;
+  if (!job) {
+    box.style.display = 'none';
+    box.textContent = '';
+    return;
+  }
+
+  box.style.display = '';
+  box.textContent = '';
+  var label = document.createElement('span');
+  label.textContent = email + ': ' + (job.message || job.status || 'Login task updated.');
+  box.appendChild(label);
+  if (job.manualUrl) {
+    var link = document.createElement('a');
+    link.href = job.manualUrl;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = ' Open manual login';
+    link.style.marginLeft = '8px';
+    box.appendChild(link);
+  }
+}
+
+function formatLoginFailure(job) {
+  var parts = [];
+  if (job && job.failure) {
+    parts.push('[' + job.failure.code + '] ' + job.failure.message);
+  } else if (job && job.message) {
+    parts.push(job.message);
+  } else {
+    parts.push('Login failed.');
+  }
+  if (job && job.apiFailure && (!job.failure || job.apiFailure.code !== job.failure.code)) {
+    parts.push('API [' + job.apiFailure.code + ']: ' + job.apiFailure.message);
+  }
+  return parts.join(' ');
+}
+
+function rememberLoginJob(job) {
+  if (!job || !job.email) return;
+  var key = job.email.toLowerCase();
+  var current = activeLoginJobs[key];
+  if (!current || (job.updatedAt || 0) >= (current.updatedAt || 0)) activeLoginJobs[key] = job;
+}
+
+function syncLoginJobs(payload) {
+  if (!payload || !Array.isArray(payload.jobs)) return;
+  for (var i = 0; i < payload.jobs.length; i++) {
+    rememberLoginJob(payload.jobs[i]);
+    if (isActiveLoginStatus(payload.jobs[i].status)) pollLoginJob(payload.jobs[i].email, payload.jobs[i].id);
+  }
+}
+
 /* ── Accounts Table ── */
 function getAuthStatus(acct) {
+  var job = getLoginJob(acct.email);
+  if (job) {
+    if (job.status === 'authenticated') return 'live';
+    if (job.status === 'api_login' || job.status === 'browser_login') return 'connecting';
+    if (job.status === 'queued' || job.status === 'captcha' || job.status === 'awaiting_manual') return 'pending';
+  }
   if (acct.startupStatus === 'connecting') return 'connecting';
   if (acct.startupStatus === 'initializing' || acct.startupStatus === 'pending') {
     return 'pending';
@@ -45,7 +120,15 @@ function getAuthStatus(acct) {
   return 'unknown';
 }
 
-function getAuthLabel(status) {
+function getAuthLabel(status, job) {
+  if (job) {
+    if (job.status === 'queued') return 'Login queued';
+    if (job.status === 'api_login') return 'API login...';
+    if (job.status === 'browser_login') return 'Browser login...';
+    if (job.status === 'captcha') return 'CAPTCHA required';
+    if (job.status === 'awaiting_manual') return 'Awaiting manual login';
+    if (job.status === 'failed') return 'Login failed';
+  }
   if (status === 'live') return 'Authenticated';
   if (status === 'pending') return 'Starting...';
   if (status === 'connecting') return 'Connecting...';
@@ -81,15 +164,21 @@ function renderAccountsTable(accts) {
   var rows = '';
   for (var i = 0; i < accts.length; i++) {
     var a = accts[i];
+    var job = getLoginJob(a.email);
     var status = getAuthStatus(a);
-    var label = getAuthLabel(status);
+    var label = getAuthLabel(status, job);
     var hideLogin = status === 'live' ? ' style="display:none"' : '';
+    var disableLogin = job && isActiveLoginStatus(job.status) ? ' disabled' : '';
+    var loginLabel = job && job.status === 'failed' ? 'Retry Login' : job && isActiveLoginStatus(job.status) ? 'Working...' : 'Login';
+    var statusTitle = job && job.message ? ' title="' + escHtml(job.message) + '"' : '';
     rows +=
       '<tr>' +
       '<td>' +
       escHtml(a.email) +
       '</td>' +
-      '<td><div class="auth-status"><span class="auth-dot ' +
+      '<td><div class="auth-status"' +
+      statusTitle +
+      '><span class="auth-dot ' +
       status +
       '"></span>' +
       label +
@@ -126,7 +215,10 @@ function renderAccountsTable(accts) {
       escHtml(a.email) +
       '" data-action="login"' +
       hideLogin +
-      '>Login</button>' +
+      disableLogin +
+      '>' +
+      loginLabel +
+      '</button>' +
       '</div></td></tr>';
   }
   document.getElementById('acctBody').innerHTML = rows;
@@ -134,8 +226,9 @@ function renderAccountsTable(accts) {
 
 /* ── Load Accounts ── */
 async function loadAccounts() {
-  var data = await apiFetch('/accounts');
-  renderAccountsTable(data);
+  var results = await Promise.all([apiFetch('/accounts'), apiFetch('/api/accounts/login-jobs')]);
+  syncLoginJobs(results[1]);
+  renderAccountsTable(results[0]);
 }
 
 /* ── Add Account ── */
@@ -164,10 +257,8 @@ function handleAdd(email, password) {
       }
       if (result.loginSucceeded) {
         showToast('Account added and logged in: ' + email, 'success');
-        pollAuth(email, 15);
       } else {
         showToast(result.loginError || 'Account added but login failed. Click Login to open browser.', 'warning');
-        pollAuth(email, 15);
       }
       loadAccounts();
     } catch (e) {
@@ -215,9 +306,17 @@ function handleRemove(email) {
   };
 }
 
-/* ── Manual Login (Autofill) ── */
-function handleManualLogin(email) {
-  var btn = document.querySelector('button[data-email="' + escHtml(email) + '"][data-action="login"]');
+function findLoginButton(email) {
+  var buttons = document.querySelectorAll('button[data-action="login"]');
+  for (var i = 0; i < buttons.length; i++) {
+    if (buttons[i].getAttribute('data-email') === email) return buttons[i];
+  }
+  return null;
+}
+
+/* ── Login Jobs ── */
+function handleLogin(email) {
+  var btn = findLoginButton(email);
   if (btn) {
     btn.textContent = 'Authorizing...';
     btn.disabled = true;
@@ -225,9 +324,10 @@ function handleManualLogin(email) {
   setError(null);
   (async function () {
     try {
-      var res = await fetch('/api/accounts/' + encodeURIComponent(email) + '/autofill', {
-        method: 'GET',
-        headers: authHeaders(),
+      var res = await fetch('/api/accounts/' + encodeURIComponent(email) + '/login', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+        body: JSON.stringify({ mode: 'auto' }),
       });
       var result;
       try {
@@ -238,52 +338,82 @@ function handleManualLogin(email) {
       if (!res.ok) {
         throw new Error(result && result.error && result.error.message ? result.error.message : 'Login failed (' + res.status + ')');
       }
-      showToast('Browser opened for ' + email + '. Complete login manually.', 'info');
-      pollAuth(email, 30);
+      rememberLoginJob(result.job);
+      setLoginJobNotice(email, result.job);
+      showToast(result.reused ? 'Existing login task is still running.' : 'Login task started for ' + email, 'info');
+      loadAccounts();
+      pollLoginJob(email, result.jobId);
     } catch (e) {
       setError(e.message);
       showToast(e.message, 'error');
+      if (btn) {
+        btn.textContent = 'Login';
+        btn.disabled = false;
+      }
     }
   })();
 }
 
-/* ── Poll Auth ── */
-var activePollTimers = {};
-function pollAuth(email, maxAttempts) {
+function pollLoginJob(email, jobId) {
   if (activePollTimers[email]) {
-    clearInterval(activePollTimers[email]);
-    delete activePollTimers[email];
+    if (activePollTimers[email].jobId === jobId) return;
+    clearTimeout(activePollTimers[email].timer);
   }
+
   var attempt = 0;
-  var timer = setInterval(async function () {
-    attempt++;
+  async function tick() {
+    attempt += 1;
     try {
-      var data = await apiFetch('/accounts');
-      if (!Array.isArray(data)) {
-        clearInterval(timer);
+      var res = await fetch('/api/accounts/' + encodeURIComponent(email) + '/login-jobs/' + encodeURIComponent(jobId), {
+        headers: authHeaders(),
+      });
+      var result = await res.json().catch(function () {
+        return null;
+      });
+      if (!res.ok || !result || !result.job) {
+        throw new Error(result && result.error && result.error.message ? result.error.message : 'Login status unavailable.');
+      }
+
+      var job = result.job;
+      rememberLoginJob(job);
+      setLoginJobNotice(email, job);
+      loadAccounts();
+
+      if (job.status === 'authenticated') {
         delete activePollTimers[email];
+        delete manualNotifications[jobId];
+        setError(null);
+        showToast('Login completed for ' + email + ' via ' + (job.method || 'Qwen') + '.', 'success');
         return;
       }
-      for (var i = 0; i < data.length; i++) {
-        if (data[i].email === email && data[i].authenticated) {
-          clearInterval(timer);
-          delete activePollTimers[email];
-          showToast('Login completed for ' + email, 'success');
-          loadAccounts();
-          return;
-        }
+      if (job.status === 'failed') {
+        delete activePollTimers[email];
+        delete manualNotifications[jobId];
+        var failureMessage = formatLoginFailure(job);
+        setError(failureMessage);
+        showToast(failureMessage, 'error');
+        return;
       }
-    } catch {
-      clearInterval(timer);
+      if ((job.status === 'captcha' || job.status === 'awaiting_manual') && !manualNotifications[jobId]) {
+        manualNotifications[jobId] = true;
+        showToast(job.message || 'Complete the Qwen login manually.', 'warning');
+      }
+    } catch (e) {
       delete activePollTimers[email];
+      setError(e.message);
+      showToast(e.message, 'error');
+      return;
     }
-    if (attempt >= maxAttempts) {
-      clearInterval(timer);
+
+    if (attempt >= 300) {
       delete activePollTimers[email];
-      loadAccounts();
+      showToast('Login task is still running. Refresh to resume status polling.', 'warning');
+      return;
     }
-  }, 2000);
-  activePollTimers[email] = timer;
+    activePollTimers[email] = { jobId: jobId, timer: setTimeout(tick, 2000) };
+  }
+
+  activePollTimers[email] = { jobId: jobId, timer: setTimeout(tick, 250) };
 }
 
 /* ── Toggle Disabled ── */
@@ -334,7 +464,7 @@ function init() {
     var email = btn.getAttribute('data-email');
     var action = btn.getAttribute('data-action');
     if (!email || !action) return;
-    if (action === 'login') handleManualLogin(email);
+    if (action === 'login') handleLogin(email);
     else if (action === 'remove') handleRemove(email);
   });
 

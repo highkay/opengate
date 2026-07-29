@@ -19,6 +19,7 @@ ${sidebarHtml('accounts')}
 
     <!-- Error Display -->
     <div class="error-box" id="errorBox"></div>
+    <div id="loginJobBox" style="display:none;margin-bottom:16px;padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-elevated);font-size:0.78rem;line-height:1.5"></div>
 
     <!-- Add Account Form -->
     <div class="panel">

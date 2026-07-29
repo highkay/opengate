@@ -1,6 +1,14 @@
 import { Hono } from 'hono';
 import { addAccount, getAccountByEmail, getAccounts, removeAccount, setAccountDisabled } from '../services/auth.ts';
-import { logStore } from '../services/logStore.ts';
+import {
+  getActiveLoginJob,
+  getLoginJob,
+  type LoginJob,
+  LoginJobStartError,
+  listLoginJobs,
+  startLoginJob,
+  waitForActionableLoginJob,
+} from '../services/loginJobs.ts';
 
 const accountActionRateLimit = new Map<string, number[]>();
 
@@ -16,6 +24,28 @@ function checkRateLimit(key: string, maxPerMinute: number = 10): boolean {
 
 export const accountsRouter = new Hono();
 
+function loginJobPayload(job: LoginJob, reused: boolean = false) {
+  return {
+    success: true,
+    email: job.email,
+    jobId: job.id,
+    status: job.status,
+    authenticated: job.status === 'authenticated',
+    reused,
+    job,
+  };
+}
+
+function loginStartErrorResponse(c: any, error: unknown) {
+  if (error instanceof LoginJobStartError) {
+    const status = error.code === 'account_not_found' ? 404 : 400;
+    return c.json({ error: { code: error.code, message: error.message } }, status);
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  console.error('[Accounts] Login job start failed:', message);
+  return c.json({ error: { code: 'login_job_start_failed', message: 'Failed to start login task' } }, 500);
+}
+
 accountsRouter.get('/', (c) => {
   const accounts = getAccounts();
   const masked = accounts.map((a) => ({
@@ -29,8 +59,13 @@ accountsRouter.get('/', (c) => {
     inFlight: a.inFlight,
     totalRequests: a.totalRequests,
     startupStatus: a.startupStatus || null,
+    loginJob: getActiveLoginJob(a.email),
   }));
   return c.json({ count: masked.length, accounts: masked });
+});
+
+accountsRouter.get('/login-jobs', (c) => {
+  return c.json({ jobs: listLoginJobs() });
 });
 
 accountsRouter.post('/', async (c) => {
@@ -111,91 +146,95 @@ accountsRouter.delete('/:email', async (c) => {
 
 /**
  * GET /api/accounts/:email/login
- * Trigger browser login for a specific account
+ * Compatibility endpoint: run the new login task and wait for an actionable state.
  */
 accountsRouter.get('/:email/login', async (c) => {
   try {
     const email = decodeURIComponent(c.req.param('email'));
-    const account = getAccountByEmail(email);
+    const started = startLoginJob(email, 'auto');
+    const job = await waitForActionableLoginJob(started.job.id);
+    if (!job) return c.json({ error: { code: 'login_job_not_found', message: 'Login task was not found' } }, 404);
 
-    if (!account) {
-      return c.json({ error: { message: `Account ${email} not found` } }, 404);
+    if (job.status === 'authenticated') {
+      return c.json({ ...loginJobPayload(job, started.reused), method: job.method });
     }
-
-    if (!account.password) {
-      return c.json({ error: { message: 'No password stored for this account' } }, 400);
-    }
-
-    // Prefer API login (browserlessFetch) — same path that historically issued tokens
-    const { loginFresh, getLastLoginFailure } = await import('../services/loginService.ts');
-    const apiState = await loginFresh(account.email, account.password);
-    if (apiState) {
-      account.state = apiState;
-      const { saveCookies } = await import('../services/auth.ts');
-      await saveCookies(account.email, apiState.token, apiState.refreshToken, apiState.expiresAt);
-      return c.json({ success: true, email: account.email, authenticated: true, method: 'api' });
-    }
-
-    const apiFailure = getLastLoginFailure();
-
-    // Browser profile fallback
-    const { openBrowserProfile } = await import('../services/playwright.ts');
-    const loginResult = await openBrowserProfile(account.email, account.password, { headless: true });
-
-    if (loginResult === 'success') {
-      const { loadCookiesFromProfile } = await import('../services/auth.ts');
-      const profileState = await loadCookiesFromProfile(account.email);
-      if (profileState) {
-        account.state = profileState;
-        return c.json({ success: true, email: account.email, authenticated: true, method: 'browser' });
-      }
-      return c.json({ success: true, email: account.email, authenticated: true, method: 'browser' });
-    } else if (loginResult === 'captcha') {
+    if (job.status === 'awaiting_manual') {
       return c.json(
         {
           error: {
-            message: 'CAPTCHA required — use autofill to complete manually',
-            apiFailure: apiFailure ? { code: apiFailure.code, message: apiFailure.message } : undefined,
+            code: 'awaiting_manual',
+            message: job.message,
+            manualUrl: job.manualUrl,
+            apiFailure: job.apiFailure,
           },
+          email: job.email,
+          jobId: job.id,
+          status: job.status,
+          job,
         },
         400,
       );
-    } else {
-      const detail = apiFailure
-        ? `API: [${apiFailure.code}] ${apiFailure.message}. Browser: launch/login failed.`
-        : 'API and browser login both failed — check system logs (WAF / Chromium), not only credentials.';
-      return c.json({ error: { message: detail } }, 500);
     }
-  } catch (err: any) {
-    console.error('[Accounts] LOGIN failed:', err.message);
-    return c.json({ error: { message: 'Login failed' } }, 500);
+
+    if (job.status === 'failed') {
+      return c.json(
+        {
+          error: job.failure,
+          email: job.email,
+          jobId: job.id,
+          status: job.status,
+          apiFailure: job.apiFailure,
+          job,
+        },
+        job.failure?.stage === 'account' ? 400 : 500,
+      );
+    }
+
+    return c.json(loginJobPayload(job, started.reused), 202);
+  } catch (error) {
+    return loginStartErrorResponse(c, error);
   }
+});
+
+/** POST /api/accounts/:email/login — start or reuse an asynchronous login task. */
+accountsRouter.post('/:email/login', async (c) => {
+  try {
+    const email = decodeURIComponent(c.req.param('email'));
+    let mode: 'auto' | 'manual' = 'auto';
+    const contentType = c.req.header('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const body = await c.req.json();
+      if (body?.mode !== undefined && body.mode !== 'auto' && body.mode !== 'manual') {
+        return c.json({ error: { code: 'invalid_login_mode', message: 'mode must be auto or manual' } }, 400);
+      }
+      if (body?.mode === 'manual') mode = 'manual';
+    }
+    const started = startLoginJob(email, mode);
+    return c.json(loginJobPayload(started.job, started.reused), 202);
+  } catch (error) {
+    return loginStartErrorResponse(c, error);
+  }
+});
+
+/** GET /api/accounts/:email/login-jobs/:jobId — query a login task without exposing credentials. */
+accountsRouter.get('/:email/login-jobs/:jobId', (c) => {
+  const email = decodeURIComponent(c.req.param('email')).toLowerCase().trim();
+  const job = getLoginJob(c.req.param('jobId'));
+  if (!job || job.email !== email) {
+    return c.json({ error: { code: 'login_job_not_found', message: 'Login task was not found' } }, 404);
+  }
+  return c.json(loginJobPayload(job));
 });
 
 accountsRouter.get('/:email/autofill', async (c) => {
   try {
     const email = decodeURIComponent(c.req.param('email'));
-    const account = getAccountByEmail(email);
-    if (!account) return c.json({ error: { message: `Account ${email} not found` } }, 404);
-    if (!account.password) return c.json({ error: { message: 'No password stored' } }, 400);
-
-    (async () => {
-      try {
-        const { openBrowserProfile } = await import('../services/playwright.ts');
-        const loginResult = await openBrowserProfile(account.email, account.password, { headless: false });
-        if (loginResult === 'success') {
-          const { loadCookiesFromProfile } = await import('../services/auth.ts');
-          const profileState = await loadCookiesFromProfile(account.email);
-          if (profileState) account.state = profileState;
-        }
-      } catch (err: any) {
-        logStore.log('error', 'auth', err.message || String(err));
-      }
-    })();
-
-    return c.json({ success: true, email: account.email, message: 'Browser opened. Complete login manually.' });
-  } catch (err: any) {
-    console.error('[Accounts] AUTOFILL failed:', err.message);
-    return c.json({ error: { message: 'Auto-fill login failed' } }, 500);
+    const started = startLoginJob(email, 'manual');
+    return c.json({
+      ...loginJobPayload(started.job, started.reused),
+      message: started.reused ? 'Existing login task is still running.' : 'Manual browser login task queued.',
+    });
+  } catch (error) {
+    return loginStartErrorResponse(c, error);
   }
 });
