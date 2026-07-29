@@ -4,6 +4,7 @@
  * Contains the three login strategies: browser context, fetch, and temp context.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import crypto from 'crypto';
 import type { AuthState } from '../types/auth.ts';
 import { getAuthTokenMaxAgeMs } from './auth.ts';
@@ -32,24 +33,46 @@ export interface LoginFailure {
   retryable: boolean;
 }
 
-let lastLoginFailure: LoginFailure | null = null;
-
-export function getLastLoginFailure(): LoginFailure | null {
-  return lastLoginFailure;
+interface LoginFailureScope {
+  email: string;
 }
 
-export function clearLastLoginFailure(): void {
-  lastLoginFailure = null;
+const loginFailureScope = new AsyncLocalStorage<LoginFailureScope>();
+const loginFailuresByEmail = new Map<string, LoginFailure>();
+
+export function beginLoginFailureScope(email: string): void {
+  const normalizedEmail = email.toLowerCase().trim();
+  loginFailureScope.enterWith({ email: normalizedEmail });
+  loginFailuresByEmail.delete(normalizedEmail);
 }
 
-function setLastLoginFailure(failure: LoginFailure): void {
-  lastLoginFailure = failure;
+export function getLastLoginFailure(email?: string): LoginFailure | null {
+  const scopedEmail = email?.toLowerCase().trim() || loginFailureScope.getStore()?.email;
+  if (scopedEmail) return loginFailuresByEmail.get(scopedEmail) ?? null;
+  if (loginFailuresByEmail.size === 1) return loginFailuresByEmail.values().next().value ?? null;
+  return null;
+}
+
+export function clearLastLoginFailure(email?: string): void {
+  const scopedEmail = email?.toLowerCase().trim() || loginFailureScope.getStore()?.email;
+  if (scopedEmail) loginFailuresByEmail.delete(scopedEmail);
+}
+
+function setLastLoginFailure(email: string, failure: LoginFailure): void {
+  loginFailuresByEmail.set(email.toLowerCase().trim(), failure);
 }
 
 const API_LOGIN_MAX_ATTEMPTS = 3;
 const API_LOGIN_BASE_DELAY_MS = 800;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export interface LoginRetryOptions {
+  maxAttempts?: number;
+  baseDelayMs?: number;
+  random?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+}
 
 /** Detect Aliyun WAF / challenge HTML masquerading as a 200. Exported for tests. */
 export function isWafResponseBody(bodyText: string, contentType: string | null | undefined): boolean {
@@ -62,7 +85,7 @@ export function isWafResponseBody(bodyText: string, contentType: string | null |
   return false;
 }
 
-function extractTokensFromSetCookie(response: Response): { token: string | null; refreshToken: string | null } {
+export function extractTokensFromSetCookie(response: Response): { token: string | null; refreshToken: string | null } {
   let token: string | null = null;
   let refreshToken: string | null = null;
   const hdrs = response.headers as Headers & { getSetCookie?: () => string[] };
@@ -71,12 +94,24 @@ function extractTokensFromSetCookie(response: Response): { token: string | null;
 
   for (const cookie of setCookies) {
     if (!cookie) continue;
-    const tokenMatch = cookie.match(/(?:^|,\s*)token=([^;]+)/i) || cookie.match(/\btoken=([^;]+)/i);
-    if (tokenMatch && !token) token = tokenMatch[1];
-    const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/i);
-    if (refreshMatch) refreshToken = refreshMatch[1];
+    const cookiePair = cookie.match(/^\s*([^=;,\s]+)=([^;]*)/);
+    if (!cookiePair) continue;
+    const name = cookiePair[1].toLowerCase();
+    if (name === 'token' && !token) token = cookiePair[2];
+    if (name === 'refresh_token') refreshToken = cookiePair[2];
   }
   return { token, refreshToken };
+}
+
+export function findAuthCookieValues(cookies: Array<{ name: string; value: string }>): {
+  token: string | null;
+  refreshToken: string | null;
+} {
+  const cookieMap = new Map(cookies.map((cookie) => [cookie.name.toLowerCase(), cookie.value]));
+  return {
+    token: cookieMap.get('token') ?? cookieMap.get('session_token') ?? cookieMap.get('access_token') ?? null,
+    refreshToken: cookieMap.get('refresh_token') ?? null,
+  };
 }
 
 function classifyBusinessFailure(data: any): LoginFailure | null {
@@ -245,16 +280,9 @@ export async function loginFreshViaBrowser(email: string, hashedPassword: string
     let cookieRefresh: string | null = null;
     try {
       const cookies = await page.context().cookies();
-      const tokenCookie = cookies.find(
-        (c) =>
-          c.name === 'token' ||
-          (c.name.toLowerCase().includes('token') && c.domain.includes('qwen') && !c.name.toLowerCase().includes('refresh')),
-      );
-      const refreshCookie = cookies.find(
-        (c) => c.name === 'refresh_token' || (c.name.toLowerCase().includes('refresh') && c.domain.includes('qwen')),
-      );
-      cookieToken = tokenCookie?.value || null;
-      cookieRefresh = refreshCookie?.value || null;
+      const authCookies = findAuthCookieValues(cookies);
+      cookieToken = authCookies.token;
+      cookieRefresh = authCookies.refreshToken;
     } catch (err: any) {
       logStore.log('warn', 'auth', `Cookie read failed for ${email}: ${err.message}`);
     }
@@ -423,35 +451,43 @@ async function loginFreshViaFetchOnce(
  * Login via browserlessFetch (wreq TLS + acw_tc + bx) with limited backoff retries.
  * Retries only WAF / network / transient HTTP failures — never credential errors.
  */
-export async function loginFreshViaFetch(email: string, hashedPassword: string): Promise<AuthState | null> {
-  clearLastLoginFailure();
+export async function loginFreshViaFetch(
+  email: string,
+  hashedPassword: string,
+  retryOptions: LoginRetryOptions = {},
+): Promise<AuthState | null> {
+  beginLoginFailureScope(email);
   let lastFailure: LoginFailure | null = null;
+  const maxAttempts = retryOptions.maxAttempts ?? API_LOGIN_MAX_ATTEMPTS;
+  const baseDelayMs = retryOptions.baseDelayMs ?? API_LOGIN_BASE_DELAY_MS;
+  const random = retryOptions.random ?? Math.random;
+  const wait = retryOptions.sleep ?? sleep;
 
-  for (let attempt = 1; attempt <= API_LOGIN_MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const { state, failure } = await loginFreshViaFetchOnce(email, hashedPassword);
     if (state) {
       clearLastLoginFailure();
       if (attempt > 1) {
-        logStore.log('info', 'auth', `API login succeeded for ${email} on attempt ${attempt}/${API_LOGIN_MAX_ATTEMPTS}`);
+        logStore.log('info', 'auth', `API login succeeded for ${email} on attempt ${attempt}/${maxAttempts}`);
       }
       return state;
     }
 
     lastFailure = failure;
-    const canRetry = !!failure?.retryable && attempt < API_LOGIN_MAX_ATTEMPTS;
+    const canRetry = !!failure?.retryable && attempt < maxAttempts;
     if (!canRetry) break;
 
-    const delay = API_LOGIN_BASE_DELAY_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+    const delay = baseDelayMs * 2 ** (attempt - 1) + Math.floor(random() * 250);
     logStore.log(
       'warn',
       'auth',
-      `API login attempt ${attempt}/${API_LOGIN_MAX_ATTEMPTS} failed for ${email} (${failure?.code}): ${failure?.message}. Retrying in ${delay}ms...`,
+      `API login attempt ${attempt}/${maxAttempts} failed for ${email} (${failure?.code}): ${failure?.message}. Retrying in ${delay}ms...`,
     );
-    await sleep(delay);
+    await wait(delay);
   }
 
   if (lastFailure) {
-    setLastLoginFailure(lastFailure);
+    setLastLoginFailure(email, lastFailure);
     logStore.log('warn', 'auth', `API login failed for ${email} [${lastFailure.code}]: ${lastFailure.message}`);
   } else {
     const fallback: LoginFailure = {
@@ -459,7 +495,7 @@ export async function loginFreshViaFetch(email: string, hashedPassword: string):
       message: 'API login failed with no classified reason',
       retryable: false,
     };
-    setLastLoginFailure(fallback);
+    setLastLoginFailure(email, fallback);
     logStore.log('warn', 'auth', `API login failed for ${email}: ${fallback.message}`);
   }
 
@@ -543,16 +579,9 @@ export async function loginViaTempContext(
       // Check cookies as fallback
       try {
         const cookies = await context.cookies();
-        const tokenCookie = cookies.find(
-          (c) =>
-            c.name === 'token' ||
-            (c.name.toLowerCase().includes('token') && c.domain.includes('qwen') && !c.name.toLowerCase().includes('refresh')),
-        );
-        const refreshCookie = cookies.find(
-          (c) => c.name === 'refresh_token' || (c.name.toLowerCase().includes('refresh') && c.domain.includes('qwen')),
-        );
-        if (tokenCookie?.value) capturedToken = tokenCookie.value;
-        if (refreshCookie?.value) capturedRefresh = refreshCookie.value;
+        const authCookies = findAuthCookieValues(cookies);
+        if (authCookies.token) capturedToken = authCookies.token;
+        if (authCookies.refreshToken) capturedRefresh = authCookies.refreshToken;
       } catch {
         logStore.log('warn', 'auth', `cookie read failed during poll for ${email}`);
       }

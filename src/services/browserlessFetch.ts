@@ -12,6 +12,7 @@
  */
 
 import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
+import { mergeCookieHeaders } from './browserRuntime.ts';
 import { extractBxUmidtoken } from './bxTokenExtractor.ts';
 import { generateBxPp, generateBxUa, refreshCookiesViaBrowser } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
@@ -67,8 +68,8 @@ async function refreshAcwTcCookie(): Promise<string | null> {
     }
     if (acwTc) {
       tokenCache.set('acw_tc', acwTc, ACW_TC_REFRESH_MS * 2);
-      logStore.log('debug', 'browserless', `acw_tc cookie refreshed: ${acwTc.substring(0, 16)}...`);
-      logEvent('refreshAcwTcCookie', 'acw_tc obtained', { acwTc: acwTc.substring(0, 16) });
+      logStore.log('debug', 'browserless', 'acw_tc cookie refreshed');
+      logEvent('refreshAcwTcCookie', 'acw_tc obtained');
     } else {
       logEvent('refreshAcwTcCookie', 'no acw_tc in response');
     }
@@ -101,10 +102,7 @@ async function ensureAcwTcCookie(headers: Record<string, string>): Promise<void>
     acwTc = await refreshAcwTcCookie();
   }
   if (acwTc) {
-    const existing = headers['cookie'] || '';
-    if (!existing.includes('acw_tc=')) {
-      headers['cookie'] = existing ? `${existing}; acw_tc=${acwTc}` : `acw_tc=${acwTc}`;
-    }
+    headers['cookie'] = mergeCookieHeaders(headers['cookie'], `acw_tc=${acwTc}`);
   }
 }
 
@@ -192,42 +190,12 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       logEvent('browserlessFetch', 'WAF detected', { url: url.split('?')[0], status: response.status });
       logStore.log('warn', 'browserless', `WAF detected on ${url.split('?')[0]} — trying HTTP refresh first...`);
       const currentCookie = headers['cookie'] || '';
+      let needsBrowserRefresh = true;
 
       const freshAcwTc = await refreshAcwTcCookie();
-      if (freshAcwTc && !currentCookie.includes('acw_tc=')) {
-        headers['cookie'] = currentCookie ? `${currentCookie}; acw_tc=${freshAcwTc}` : `acw_tc=${freshAcwTc}`;
-      }
-
-      const responseText = await response.text().catch(() => '');
-      const isStillWaf = !responseText || responseText.includes('aliyun_waf') || responseText.includes('<html');
-      if (!isStillWaf) {
-        // The acw_tc refresh worked — response body is valid
-        return response;
-      }
-
-      logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
-      const key = accountEmail || '_default_';
-      let promise = cookieRefreshInFlight.get(key);
-      if (!promise) {
-        promise = refreshCookiesViaBrowser(currentCookie).finally(() => {
-          cookieRefreshInFlight.delete(key);
-        });
-        cookieRefreshInFlight.set(key, promise);
-      }
-      const freshCookies = await promise;
-      if (freshCookies) {
-        headers['cookie'] = freshCookies;
-        tokenCache.delete('bx-ua');
-        tokenCache.delete('bx-pp');
-        tokenCache.delete('acw_tc');
-        await ensureBxUmidtoken(headers);
-        headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
-        const pp = await generateBxPp(body);
-        if (pp) headers['bx-pp'] = pp;
-        logStore.log('info', 'browserless', `Retrying ${url.split('?')[0]} with fresh cookies...`);
-
-        logEvent('browserlessFetch', 'WAF retry', { url: url.split('?')[0] });
-        logFetchCall('browserlessFetch.retry', url, method);
+      if (freshAcwTc) {
+        headers['cookie'] = mergeCookieHeaders(currentCookie, `acw_tc=${freshAcwTc}`);
+        logEvent('browserlessFetch', 'HTTP cookie retry', { url: url.split('?')[0] });
         response = await wreqFetch(url, {
           method,
           headers,
@@ -236,13 +204,50 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
           stream: !!stream,
           debugLogDir: process.env.DEBUG_IMPERS_DIR,
         });
-        logFetchCall('browserlessFetch.retry', url, method, response.status);
-        if (wafCheck(response)) {
-          throw new Error(`WAF challenge persists after cookie refresh for ${url.split('?')[0]}`);
-        }
+        logFetchCall('browserlessFetch.http-cookie-retry', url, method, response.status);
+        needsBrowserRefresh = wafCheck(response);
       }
-      if (!freshCookies) {
-        throw new Error(`Cookie refresh failed for ${url.split('?')[0]} — cannot retry`);
+
+      if (needsBrowserRefresh) {
+        logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
+        const key = accountEmail || '_default_';
+        let promise = cookieRefreshInFlight.get(key);
+        if (!promise) {
+          promise = refreshCookiesViaBrowser(currentCookie).finally(() => {
+            cookieRefreshInFlight.delete(key);
+          });
+          cookieRefreshInFlight.set(key, promise);
+        }
+        const freshCookies = await promise;
+        if (freshCookies) {
+          headers['cookie'] = mergeCookieHeaders(currentCookie, headers['cookie'], freshCookies);
+          tokenCache.delete('bx-ua');
+          tokenCache.delete('bx-pp');
+          tokenCache.delete('acw_tc');
+          await ensureBxUmidtoken(headers);
+          headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
+          const pp = await generateBxPp(body);
+          if (pp) headers['bx-pp'] = pp;
+          logStore.log('info', 'browserless', `Retrying ${url.split('?')[0]} with fresh cookies...`);
+
+          logEvent('browserlessFetch', 'WAF retry', { url: url.split('?')[0] });
+          logFetchCall('browserlessFetch.retry', url, method);
+          response = await wreqFetch(url, {
+            method,
+            headers,
+            body,
+            signal,
+            stream: !!stream,
+            debugLogDir: process.env.DEBUG_IMPERS_DIR,
+          });
+          logFetchCall('browserlessFetch.retry', url, method, response.status);
+          if (wafCheck(response)) {
+            throw new Error(`WAF challenge persists after cookie refresh for ${url.split('?')[0]}`);
+          }
+        }
+        if (!freshCookies) {
+          throw new Error(`Cookie refresh failed for ${url.split('?')[0]} — cannot retry`);
+        }
       }
     }
 

@@ -8,6 +8,7 @@
 import crypto from 'node:crypto';
 import type { AuthState } from '../types/auth.ts';
 import {
+  beginLoginFailureScope,
   clearLastLoginFailure,
   getLastLoginFailure,
   type LoginFailure,
@@ -23,7 +24,7 @@ export { clearLastLoginFailure, getLastLoginFailure, type LoginFailure };
 const loginMutex = new Mutex();
 
 export async function loginFresh(email: string, password: string): Promise<AuthState | null> {
-  clearLastLoginFailure();
+  beginLoginFailureScope(email);
   const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
 
   // Primary path: browserlessFetch (wreq + acw_tc + bx) — same transport as chat

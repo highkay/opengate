@@ -4,11 +4,16 @@
  * Handles persistent browser profiles, auto-fill login, and token refresh via profiles.
  */
 
-import { launchPersistentContext as cloakPersistentContext } from 'cloakbrowser';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import type { Cookie } from 'playwright';
 import { projectPath } from '../utils/paths.ts';
+import {
+  BROWSER_DEFAULT_ARGS,
+  getHeadedBrowserAvailability,
+  launchPersistentBrowserContext,
+  prepareCaptchaHandoff,
+} from './browserRuntime.ts';
 import { logStore } from './logStore.ts';
 
 export function getProfileDir(email: string): string {
@@ -38,7 +43,7 @@ function cleanupSingletonLock(profileDir: string): void {
   }
 }
 
-export type LoginResult = 'success' | 'captcha' | 'closed' | 'error';
+export type LoginResult = 'success' | 'captcha' | 'browser_unavailable' | 'closed' | 'error';
 
 export interface BrowserProfileOptions {
   headless?: boolean;
@@ -48,7 +53,7 @@ import { validateQwenUrl } from './playwright.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export const BROWSER_DEFAULT_ARGS: readonly string[] = ['--no-sandbox', '--disable-setuid-sandbox', '--ozone-platform-hint=auto'];
+export { BROWSER_DEFAULT_ARGS };
 
 function getBrowserArgs(): string[] {
   return [...BROWSER_DEFAULT_ARGS];
@@ -57,7 +62,7 @@ function getBrowserArgs(): string[] {
 async function setupBrowserContext(email: string, headless: boolean): Promise<any> {
   const profileDir = getProfileDir(email);
   cleanupSingletonLock(profileDir);
-  return await cloakPersistentContext({
+  return await launchPersistentBrowserContext({
     userDataDir: profileDir,
     headless,
     humanize: true,
@@ -65,6 +70,16 @@ async function setupBrowserContext(email: string, headless: boolean): Promise<an
     viewport: { width: 1920, height: 1080 },
     args: getBrowserArgs(),
   });
+}
+
+const manualProfileContexts = new Map<string, any>();
+
+async function closeContext(context: any, email: string, reason: string): Promise<void> {
+  try {
+    await context.close();
+  } catch {
+    logStore.log('warn', 'browser', `context.close failed ${reason} for ${email}`);
+  }
 }
 
 async function checkExistingToken(context: any): Promise<boolean> {
@@ -174,6 +189,25 @@ export async function openBrowserProfile(email: string, password?: string, optio
   if (process.env.TEST_MOCK_PLAYWRIGHT) return 'success' as LoginResult;
 
   const headless = options?.headless ?? false;
+  if (!headless) {
+    const availability = getHeadedBrowserAvailability();
+    if (!availability.available) {
+      logStore.log('error', 'browser', `browser_unavailable for ${email}: ${availability.reason}`);
+      return 'browser_unavailable';
+    }
+  }
+
+  const existingManualContext = manualProfileContexts.get(email);
+  if (existingManualContext) {
+    const existingResult = await tryCheckToken(existingManualContext, email);
+    if (existingResult === 'success') {
+      manualProfileContexts.delete(email);
+      return existingResult;
+    }
+    if (existingResult !== 'closed') return 'captcha';
+    manualProfileContexts.delete(email);
+  }
+
   let context: any = null;
   let page: any = null;
 
@@ -200,6 +234,21 @@ export async function openBrowserProfile(email: string, password?: string, optio
     logStore.log('info', 'browser', `Polling for token for ${email}...`);
     const result = await pollForToken(page, context, email);
     if (result) {
+      if (result === 'captcha') {
+        logStore.log(
+          'info',
+          'browser',
+          `CAPTCHA detected for ${email}; ${headless ? 'closing headless context for handoff' : 'keeping headed context open'}`,
+        );
+        try {
+          const disposition = await prepareCaptchaHandoff(context, headless);
+          if (disposition === 'keep_open') manualProfileContexts.set(email, context);
+        } catch {
+          logStore.log('warn', 'browser', `context.close failed before headed CAPTCHA handoff for ${email}`);
+        }
+        return 'captcha';
+      }
+      manualProfileContexts.delete(email);
       logStore.log('info', 'browser', `✓ Login successful for ${email}`);
       return result;
     }
@@ -231,7 +280,7 @@ export async function refreshViaProfile(email: string): Promise<boolean> {
   let context: any = null;
 
   try {
-    context = await cloakPersistentContext({
+    context = await launchPersistentBrowserContext({
       userDataDir: profileDir,
       headless: true,
       humanize: true,

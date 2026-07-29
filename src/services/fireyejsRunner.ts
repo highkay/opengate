@@ -11,8 +11,14 @@
  *   acw_tc and other WAF session cookies. This is the only remaining
  *   browser dependency — runs once per 30 min per account.
  */
-import { writeFileSync } from 'fs';
-import { resolve } from 'path';
+import type { Browser, BrowserContext } from 'playwright';
+import {
+  getBrowserContextOptions,
+  getChromiumLaunchOptions,
+  getCookieNames,
+  mergeCookieHeaders,
+  parseCookieHeader,
+} from './browserRuntime.ts';
 import { getBxUaToken } from './bxUaGenerator.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_API_BASE } from './qwen.ts';
@@ -21,8 +27,6 @@ import { tokenCache } from './tokenCache.ts';
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const BX_UA_TTL_MS = 15 * 60 * 1000; // 15 min
-const DEFAULT_FIREYEJS_PATH = resolve(process.cwd(), 'fireyejs.js');
-
 // ─── bx-ua generation ────────────────────────────────────────────────────────
 // Pure Node.js via bxUaGenerator.ts — no browser needed.
 // Token matches real AWSC fireyejs.js output format exactly.
@@ -85,32 +89,16 @@ export async function generateBxPp(payload?: string): Promise<string | null> {
 
 // ─── Cookie refresh via browser ─────────────────────────────────────────────
 
-let playwrightBrowser: any = null;
+let playwrightBrowser: Browser | null = null;
 
-async function getBrowser(): Promise<any> {
-  if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
+async function getBrowser(): Promise<Browser> {
+  if (playwrightBrowser?.isConnected()) {
     return playwrightBrowser;
   }
   const { chromium } = await import('playwright');
-  playwrightBrowser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-  });
+  playwrightBrowser = await chromium.launch(getChromiumLaunchOptions(true));
   return playwrightBrowser;
 }
-
-async function closeBrowser(): Promise<void> {
-  if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
-    try {
-      await playwrightBrowser.close();
-    } catch {
-      // already closed
-    }
-    playwrightBrowser = null;
-  }
-}
-
-const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
 
 /**
  * Refresh cookies for an account by navigating chat.qwen.ai in a real browser.
@@ -119,20 +107,15 @@ const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
  * @returns Fresh cookie string or null
  */
 export async function refreshCookiesViaBrowser(cookieStr: string): Promise<string | null> {
-  let page: any = null;
+  let context: BrowserContext | null = null;
   try {
     const browser = await getBrowser();
-    page = await browser.newPage();
+    context = await browser.newContext(getBrowserContextOptions());
+    const page = await context.newPage();
 
     if (cookieStr) {
-      const cookies = cookieStr.split(';').map((pair: string) => {
-        const [name, ...rest] = pair.trim().split('=');
-        return { name: name.trim(), value: rest.join('=').trim(), domain: '.chat.qwen.ai', path: '/' };
-      });
-      await page
-        .context()
-        .addCookies(cookies)
-        .catch(() => {});
+      const cookies = Array.from(parseCookieHeader(cookieStr), ([name, value]) => ({ name, value, domain: '.qwen.ai', path: '/' }));
+      await context.addCookies(cookies).catch(() => {});
     }
 
     await page.goto(QWEN_API_BASE, { waitUntil: 'load', timeout: 25_000 }).catch(() => {});
@@ -143,19 +126,15 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
       await new Promise((r) => setTimeout(r, 1000));
     }
 
-    const freshCookies = await page.context().cookies();
-    const cookieMap = new Map<string, string>();
-    for (const c of freshCookies) {
-      cookieMap.set(c.name, c.value);
-    }
-
-    const freshCookieStr = Array.from(cookieMap.entries())
-      .map(([n, v]) => `${n}=${v}`)
+    const freshCookieStr = (await context.cookies())
+      .filter((cookie) => cookie.name)
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
       .join('; ');
+    const mergedCookieStr = mergeCookieHeaders(cookieStr, freshCookieStr);
 
-    if (freshCookieStr) {
-      logStore.log('info', 'fireyejs', `Cookies refreshed via browser: ${freshCookieStr.substring(0, 60)}...`);
-      return freshCookieStr;
+    if (mergedCookieStr) {
+      logStore.log('info', 'fireyejs', `Cookies refreshed via browser (${getCookieNames(mergedCookieStr).length} names)`);
+      return mergedCookieStr;
     }
     return null;
   } catch (err) {
@@ -163,9 +142,9 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
     logStore.log('warn', 'fireyejs', `Cookie refresh via browser failed: ${msg.substring(0, 100)}`);
     return null;
   } finally {
-    if (page) {
+    if (context) {
       try {
-        await page.close();
+        await context.close();
       } catch {
         /* ignore */
       }
