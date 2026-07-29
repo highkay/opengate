@@ -5,7 +5,7 @@
  * Login is in loginService.ts. Login helpers are in loginHelpers.ts.
  */
 
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import type { Cookie } from 'playwright';
 import type { AccountEntry, AuthState } from '../types/auth.ts';
@@ -19,13 +19,13 @@ import {
   loadAccountsFromFile,
   migrateFromOldPaths,
   rebuildEmailIndex,
-  resetWatcherState,
+  saveAccountsToFile,
   setupAccountWatcher as setupAccountWatcherImpl,
 } from './accountManager.ts';
 import { config } from './configService.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
-import { getActivePage, getBrowser } from './playwright.ts';
+import { getActivePage } from './playwright.ts';
 import { ensureAccountFresh, needsRefresh } from './tokenRefresh.ts';
 
 export {
@@ -61,8 +61,6 @@ export function getAuthTokenMaxAgeMs(): number {
 export function getAuthRefreshBeforeMs(): number {
   return config.getInt('AUTH_REFRESH_BEFORE_MS', 300000);
 }
-const TOKEN_DIR = join(process.cwd(), '.qwen', 'tokens');
-
 export async function checkPlaywrightSession(): Promise<boolean> {
   try {
     const page = getActivePage();
@@ -75,6 +73,83 @@ export async function checkPlaywrightSession(): Promise<boolean> {
 }
 
 let initDone = false;
+
+interface StartupAuthOptions {
+  concurrency?: number;
+  backoffMs?: number;
+  jitterMs?: number;
+  backoffMultiplier?: number;
+  maxBackoffMs?: number;
+  login?: typeof loginFresh;
+  sleep?: (delayMs: number) => Promise<void>;
+  random?: () => number;
+}
+
+function getEnvNumber(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+async function runStartupTasks<T>(
+  items: readonly T[],
+  task: (item: T) => Promise<boolean>,
+  options: StartupAuthOptions = {},
+): Promise<void> {
+  if (items.length === 0) return;
+  const concurrency = Math.max(1, Math.floor(options.concurrency ?? getEnvNumber('AUTH_STARTUP_CONCURRENCY', 1)));
+  const backoffMs = options.backoffMs ?? getEnvNumber('AUTH_STARTUP_BACKOFF_MS', 1000);
+  const jitterMs = options.jitterMs ?? getEnvNumber('AUTH_STARTUP_JITTER_MS', 500);
+  const backoffMultiplier = options.backoffMultiplier ?? getEnvNumber('AUTH_STARTUP_BACKOFF_MULTIPLIER', 2);
+  const maxBackoffMs = options.maxBackoffMs ?? getEnvNumber('AUTH_STARTUP_MAX_BACKOFF_MS', 15000);
+  const sleep = options.sleep ?? ((delayMs: number) => new Promise<void>((resolve) => setTimeout(resolve, delayMs)));
+  const random = options.random ?? Math.random;
+  let nextIndex = 0;
+
+  const worker = async (): Promise<void> => {
+    let consecutiveFailures = 0;
+    let handled = 0;
+    while (true) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      if (handled > 0) {
+        const backoff = Math.min(maxBackoffMs, backoffMs * backoffMultiplier ** Math.max(0, consecutiveFailures - 1));
+        await sleep(Math.max(0, Math.floor(backoff + random() * jitterMs)));
+      }
+      const succeeded = await task(items[index]);
+      consecutiveFailures = succeeded ? 0 : consecutiveFailures + 1;
+      handled++;
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, () => worker()));
+}
+
+export async function authenticateAccountsAtStartup(
+  accountsToLogin: readonly AccountEntry[],
+  options: StartupAuthOptions = {},
+): Promise<void> {
+  const login = options.login ?? loginFresh;
+  await runStartupTasks(
+    accountsToLogin,
+    async (acct) => {
+      acct.startupStatus = 'connecting';
+      try {
+        const newState = await login(acct.email, acct.password);
+        if (!newState) {
+          acct.startupStatus = 'pending';
+          return false;
+        }
+        await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
+        return true;
+      } catch (err: any) {
+        acct.startupStatus = 'pending';
+        logStore.log('warn', 'auth', `Startup login failed for ${acct.email}: ${err.message}`);
+        return false;
+      }
+    },
+    options,
+  );
+}
 
 export async function initAuth(onAccountReady?: (email: string) => Promise<void>): Promise<void> {
   if (initDone) return;
@@ -126,15 +201,15 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
   for (const a of merged) {
     // Reset throttledUntil to 0 if it's in the past
     const persistedUntil = (a as any).throttledUntil || 0;
-    const hasUsablePersistedToken = Boolean(a.token && (!a.expiresAt || a.expiresAt > Date.now()));
+    const hasPersistedToken = Boolean(a.token);
     accounts.push({
       email: a.email,
       password: a.password,
-      state: hasUsablePersistedToken
+      state: hasPersistedToken
         ? {
             token: a.token!,
             expiresAt: a.expiresAt || Date.now() + getAuthTokenMaxAgeMs(),
-            refreshToken: a.refreshToken || null,
+            refreshToken: a.refreshToken ?? null,
           }
         : null,
       lastUsed: 0,
@@ -145,55 +220,49 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       totalRequests: 0,
       profileCookies: a.profileCookies,
       disabled: (a as any).disabled ?? false,
-      startupStatus: 'initializing',
+      startupStatus: hasPersistedToken && (a.expiresAt || 0) > Date.now() ? 'ready' : 'initializing',
     });
   }
   rebuildEmailIndex();
 
   try {
-    // Phase 1: Load tokens from browser profiles — max 3 concurrent Chromium instances
-    const MAX_CONCURRENT_PROFILE_LOADS = 3;
-    const loadResults: Array<{ acct: (typeof accounts)[0]; source: string | null }> = [];
+    const persistedAccounts = accounts.filter((acct) => acct.state && needsRefresh(acct));
+    await runStartupTasks(persistedAccounts, async (acct) => {
+      acct.startupStatus = 'connecting';
+      const fresh = await ensureAccountFresh(acct);
+      acct.startupStatus = fresh ? 'ready' : 'pending';
+      return fresh;
+    });
 
-    for (let i = 0; i < accounts.length; i += MAX_CONCURRENT_PROFILE_LOADS) {
-      const batch = accounts.slice(i, i + MAX_CONCURRENT_PROFILE_LOADS);
-      const batchResults = await Promise.allSettled(
-        batch.map(async (acct) => {
-          const profileState = await loadCookiesFromProfile(acct.email);
-          if (profileState) {
-            acct.state = profileState;
-            return { acct, source: 'profile' as const };
-          }
-          return { acct, source: null as string | null };
-        }),
-      );
-      for (const r of batchResults) {
-        if (r.status === 'fulfilled') loadResults.push(r.value);
+    const needProfile = accounts.filter((acct) => !acct.state?.token && acct.password);
+    await runStartupTasks(needProfile, async (acct) => {
+      acct.startupStatus = 'connecting';
+      try {
+        const profileState = await loadCookiesFromProfile(acct.email);
+        if (profileState) {
+          acct.startupStatus = 'ready';
+          return true;
+        }
+        acct.startupStatus = 'pending';
+        return false;
+      } catch (err: any) {
+        acct.startupStatus = 'pending';
+        logStore.log('warn', 'auth', `Profile load failed for ${acct.email}: ${err.message}`);
+        return false;
       }
-    }
+    });
 
-    // Phase 2: Login accounts that don't have tokens yet — max 3 concurrent
     const needLogin = accounts.filter((a) => !a.state?.token && a.password);
     if (needLogin.length > 0) {
-      logStore.log('info', 'auth', `Logging in ${needLogin.length} accounts (max ${MAX_CONCURRENT_PROFILE_LOADS} concurrent)...`);
-      for (let i = 0; i < needLogin.length; i += MAX_CONCURRENT_PROFILE_LOADS) {
-        const batch = needLogin.slice(i, i + MAX_CONCURRENT_PROFILE_LOADS);
-        await Promise.allSettled(
-          batch.map(async (acct) => {
-            const newState = await loginFresh(acct.email, acct.password);
-            if (newState) {
-              acct.state = newState;
-              await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
-            }
-          }),
-        );
-      }
+      const concurrency = Math.max(1, Math.floor(getEnvNumber('AUTH_STARTUP_CONCURRENCY', 1)));
+      logStore.log('info', 'auth', `Logging in ${needLogin.length} accounts (max ${concurrency} concurrent)...`);
+      await authenticateAccountsAtStartup(needLogin);
     }
 
     // Phase 3: Run post-login callbacks in parallel
     if (onAccountReady) {
       const readyPromises = accounts
-        .filter((a) => a.state?.token)
+        .filter((a) => a.state?.token && a.state.expiresAt > Date.now())
         .map(async (acct) => {
           try {
             await onAccountReady(acct.email);
@@ -204,7 +273,10 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       await Promise.allSettled(readyPromises);
     }
 
-    const successCount = accounts.filter((a) => a.state !== null && a.state.token).length;
+    const successCount = accounts.filter((a) => a.state?.token && a.state.expiresAt > Date.now()).length;
+    for (const acct of accounts) {
+      acct.startupStatus = acct.state?.token && acct.state.expiresAt > Date.now() ? 'ready' : 'pending';
+    }
     logStore.log('info', 'auth', successCount + '/' + accounts.length + ' accounts authenticated');
 
     setupAccountWatcherImpl();
@@ -382,20 +454,35 @@ export async function saveCookies(email: string, token: string, refreshToken?: s
     }
 
     const acct = accounts.find((a) => a.email.toLowerCase().trim() === normalizedEmail);
-    if (acct && token) {
+    if (!acct) {
+      throw new Error(`Account not found: ${normalizedEmail}`);
+    }
+    if (!token) {
+      throw new Error(`Empty token for ${normalizedEmail}`);
+    }
+    const previousState = acct.state ? { ...acct.state } : null;
+    const previousStatus = acct.startupStatus;
+    const previousThrottledUntil = acct.throttledUntil;
+    try {
       acct.state = {
         token,
         expiresAt: jwtExpiresAt,
-        refreshToken: refreshToken || acct.state?.refreshToken || null,
+        refreshToken: refreshToken !== undefined ? refreshToken : acct.state?.refreshToken || null,
       };
+      acct.startupStatus = jwtExpiresAt > Date.now() ? 'ready' : 'pending';
       if (acct.throttledUntil > Date.now()) {
         acct.throttledUntil = 0;
       }
-
-      // Token lives in browser profile's Default/Cookies SQLite — no separate file needed
+      saveAccountsToFile(accounts);
+    } catch (err) {
+      acct.state = previousState;
+      acct.startupStatus = previousStatus;
+      acct.throttledUntil = previousThrottledUntil;
+      throw err;
     }
   } catch (err: any) {
     logStore.log('error', 'auth', `Failed to save cookies for ${normalizedEmail}: ${err.message}`);
+    throw err;
   }
 }
 

@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, test } from 'node:test';
 
 import { accounts } from './accountManager.ts';
@@ -30,8 +33,13 @@ describe('account inFlight and totalRequests tracking', () => {
 
 describe('saveCookies and account state', () => {
   const testEmail = 'savecookies-test@example.com';
+  let dataDir = '';
+  let previousDataDir: string | undefined;
 
   beforeEach(() => {
+    previousDataDir = process.env.QWEN_DATA_DIR;
+    dataDir = mkdtempSync(join(tmpdir(), 'opengate-auth-test-'));
+    process.env.QWEN_DATA_DIR = dataDir;
     accounts.push({
       email: testEmail,
       password: 'test-pass',
@@ -49,6 +57,9 @@ describe('saveCookies and account state', () => {
   afterEach(() => {
     accounts.length = 0;
     rebuildEmailIndex();
+    if (previousDataDir === undefined) delete process.env.QWEN_DATA_DIR;
+    else process.env.QWEN_DATA_DIR = previousDataDir;
+    rmSync(dataDir, { recursive: true, force: true });
   });
 
   test('saveCookies updates account state', async () => {

@@ -5,7 +5,7 @@
  */
 
 import type { AccountEntry } from '../types/auth.ts';
-import { getAuthRefreshBeforeMs, getAuthTokenMaxAgeMs, saveCookies } from './auth.ts';
+import { getAuthRefreshBeforeMs, saveCookies } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
@@ -17,11 +17,11 @@ export function needsRefresh(acct: AccountEntry): boolean {
 
 const QWEN_CHAT_URL = 'https://chat.qwen.ai';
 
-export async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
+export async function tryRefreshToken(acct: AccountEntry, fetcher: typeof browserlessFetch = browserlessFetch): Promise<boolean> {
   if (!acct.state?.refreshToken) return false;
 
   try {
-    const resp = await browserlessFetch(`${QWEN_CHAT_URL}/api/v2/auths/refresh`, {
+    const resp = await fetcher(`${QWEN_CHAT_URL}/api/v2/auths/refresh`, {
       method: 'POST',
       body: JSON.stringify({ refresh_token: acct.state.refreshToken }),
     });
@@ -32,15 +32,7 @@ export async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
     const data = JSON.parse(body);
     if (!data.data?.token) return false;
 
-    acct.state = {
-      token: data.data.token,
-      expiresAt: Date.now() + getAuthTokenMaxAgeMs(),
-      refreshToken: data.data.refresh_token || acct.state.refreshToken,
-    };
-    await saveCookies(acct.email, acct.state.token, acct.state.refreshToken, acct.state.expiresAt);
-    if (acct.throttledUntil > Date.now()) {
-      acct.throttledUntil = 0;
-    }
+    await saveCookies(acct.email, data.data.token, data.data.refresh_token ?? acct.state.refreshToken);
     return true;
   } catch (err: any) {
     logStore.log('error', 'auth', 'HTTP fetch failed:', err);
@@ -49,7 +41,10 @@ export async function tryRefreshToken(acct: AccountEntry): Promise<boolean> {
 }
 
 export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
-  if (acct.state && !needsRefresh(acct)) return true;
+  if (acct.state && !needsRefresh(acct)) {
+    acct.startupStatus = 'ready';
+    return true;
+  }
 
   // Avoid concurrent refresh for same account
   if (acct.refreshInFlight) {
@@ -58,6 +53,7 @@ export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
 
   acct.refreshInFlight = (async () => {
     try {
+      acct.startupStatus = 'connecting';
       if (acct.state?.refreshToken) {
         if (await tryRefreshToken(acct)) return true;
         logStore.log('warn', 'auth', `Refresh token failed for ${acct.email}`);
@@ -66,15 +62,25 @@ export async function ensureAccountFresh(acct: AccountEntry): Promise<boolean> {
       if (acct.throttledUntil > Date.now()) {
         const waitSec = Math.ceil((acct.throttledUntil - Date.now()) / 1000);
         logStore.log('warn', 'auth', `Skipping re-login for ${acct.email} — throttled for ${waitSec}s more`);
+        acct.startupStatus = 'pending';
+        return false;
+      }
+
+      if (!acct.password) {
+        acct.startupStatus = 'pending';
         return false;
       }
 
       const newState = await loginFresh(acct.email, acct.password);
       if (newState) {
-        acct.state = newState;
         await saveCookies(acct.email, newState.token, newState.refreshToken, newState.expiresAt);
         return true;
       }
+      acct.startupStatus = 'pending';
+      return false;
+    } catch (err: any) {
+      acct.startupStatus = 'pending';
+      logStore.log('error', 'auth', `Failed to refresh ${acct.email}: ${err.message}`);
       return false;
     } finally {
       acct.refreshInFlight = null;
