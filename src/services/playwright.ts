@@ -161,12 +161,10 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
       case 'chromium':
       default:
         try {
-          const profileDir = `/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`;
           defaultBrowser = await cloakLaunch({
             headless,
             humanize: true,
             geoip: true,
-            userDataDir: profileDir,
             args: [
               '--disable-dev-shm-usage',
               '--no-sandbox',
