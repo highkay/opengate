@@ -159,26 +159,40 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
         break;
       case 'chromium':
       default:
-        defaultBrowser = await cloakLaunch({
-          headless,
-          humanize: true,
-          geoip: true,
-          args: [
-            '--disable-dev-shm-usage',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-popup-blocking',
-            '--mute-audio',
-            '--no-first-run',
-            '--disable-background-networking',
-            '--disable-default-apps',
-            '--disable-sync',
-            '--disable-translate',
-            '--metrics-recording-only',
-            '--disable-blink-features=AutomationControlled',
-            `--user-data-dir=/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`,
-          ],
-        });
+        try {
+          defaultBrowser = await cloakLaunch({
+            headless,
+            humanize: true,
+            geoip: true,
+            args: [
+              '--disable-dev-shm-usage',
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-popup-blocking',
+              '--mute-audio',
+              '--no-first-run',
+              '--disable-background-networking',
+              '--disable-default-apps',
+              '--disable-sync',
+              '--disable-translate',
+              '--metrics-recording-only',
+              '--disable-blink-features=AutomationControlled',
+              `--user-data-dir=/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`,
+            ],
+          });
+        } catch (err) {
+          logStore.log('warn', 'playwright', `cloakLaunch failed, falling back to chromium.launch: ${(err as Error).message}`);
+          defaultBrowser = await chromium.launch({
+            headless,
+            ignoreDefaultArgs: ['--enable-automation'],
+            args: [
+              '--disable-dev-shm-usage',
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-blink-features=AutomationControlled',
+            ],
+          });
+        }
         break;
     }
     if (browserEngine) {
