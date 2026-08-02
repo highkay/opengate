@@ -88,8 +88,8 @@ interface StartupAuthOptions {
 function getStartupLoginOptions() {
   return {
     maxAttempts: Math.max(1, Math.floor(getEnvNumber('AUTH_STARTUP_LOGIN_ATTEMPTS', 1))),
-    allowBrowserRecovery: false,
-    allowBrowserFallback: false,
+    allowBrowserRecovery: true,
+    allowBrowserFallback: true,
   };
 }
 
