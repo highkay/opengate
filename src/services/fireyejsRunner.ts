@@ -119,10 +119,12 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
     }
 
     // Better wait strategy
-    await page.goto(QWEN_API_BASE, { 
-      waitUntil: 'networkidle', 
-      timeout: 30000 
-    }).catch(() => {});
+    await page
+      .goto(QWEN_API_BASE, {
+        waitUntil: 'networkidle',
+        timeout: 30000,
+      })
+      .catch(() => {});
 
     // Wait for WAF challenge to resolve or page to stabilize
     let stable = false;
@@ -132,7 +134,7 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
         stable = true;
         break;
       }
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise((r) => setTimeout(r, 800));
     }
     if (!stable) {
       logStore.log('warn', 'fireyejs', 'Page did not stabilize after WAF wait');
