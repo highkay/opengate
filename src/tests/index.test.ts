@@ -39,8 +39,8 @@ test('Models endpoint returns the bundled OpenAI-compatible model catalog withou
     assert.strictEqual(body.object, 'list');
     assert.ok(Array.isArray(body.data));
 
-    const model = body.data[0];
-    assert.strictEqual(model.id, 'qwen3.6-plus');
+    const model = body.data.find((m: any) => m.id === 'qwen3.6-plus');
+    assert.ok(model, 'Should include qwen3.6-plus in model catalog');
     assert.strictEqual(model.object, 'model');
     assert.ok(typeof model.created === 'number');
     assert.strictEqual(model.owned_by, 'qwen');
@@ -52,6 +52,10 @@ test('Models endpoint returns the bundled OpenAI-compatible model catalog withou
     // should not carry raw Qwen-internal fields
     assert.strictEqual(model.info, undefined);
     assert.strictEqual(model.preset, undefined);
+    // verify new flagship model is present
+    const flagship = body.data.find((m: any) => m.id === 'qwen3.8-max-preview');
+    assert.ok(flagship, 'Should include qwen3.8-max-preview in model catalog');
+    assert.strictEqual(flagship.context_window, 1000000);
   } finally {
     globalThis.fetch = originalFetch;
   }
