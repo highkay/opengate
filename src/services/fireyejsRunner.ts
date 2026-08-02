@@ -118,12 +118,24 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
       await context.addCookies(cookies).catch(() => {});
     }
 
-    await page.goto(QWEN_API_BASE, { waitUntil: 'load', timeout: 25_000 }).catch(() => {});
-    // Wait for WAF challenge to resolve (up to 15s)
-    for (let i = 0; i < 15; i++) {
+    // Better wait strategy
+    await page.goto(QWEN_API_BASE, { 
+      waitUntil: 'networkidle', 
+      timeout: 30000 
+    }).catch(() => {});
+
+    // Wait for WAF challenge to resolve or page to stabilize
+    let stable = false;
+    for (let i = 0; i < 20; i++) {
       const html = await page.evaluate(() => document.documentElement?.innerHTML || '').catch(() => '');
-      if (!html.includes('aliyun_waf')) break;
-      await new Promise((r) => setTimeout(r, 1000));
+      if (!html.includes('aliyun_waf') && html.length > 500) {
+        stable = true;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+    if (!stable) {
+      logStore.log('warn', 'fireyejs', 'Page did not stabilize after WAF wait');
     }
 
     const freshCookieStr = (await context.cookies())
@@ -139,7 +151,7 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logStore.log('warn', 'fireyejs', `Cookie refresh via browser failed: ${msg.substring(0, 100)}`);
+    logStore.log('warn', 'fireyejs', `Cookie refresh via browser failed: ${msg.substring(0, 150)}`);
     return null;
   } finally {
     if (context) {

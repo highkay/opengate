@@ -5,7 +5,7 @@
  */
 
 import type { AccountEntry } from '../types/auth.ts';
-import { getAuthRefreshBeforeMs, saveCookies } from './auth.ts';
+import { getAccounts, getAuthRefreshBeforeMs, saveCookies } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { type LoginOptions, loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
@@ -88,4 +88,35 @@ export async function ensureAccountFresh(acct: AccountEntry, loginOptions: Login
   })();
 
   return acct.refreshInFlight;
+}
+
+const BACKGROUND_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
+let backgroundRefreshStarted = false;
+
+export function startBackgroundTokenRefresh(): void {
+  if (backgroundRefreshStarted) return;
+  backgroundRefreshStarted = true;
+  logStore.log('info', 'auth', 'Background token refresh started (every 2min)');
+
+  const tick = async () => {
+    const allAccounts = getAccounts();
+    for (const acct of allAccounts) {
+      if (acct.disabled || !acct.password) continue;
+      if (!needsRefresh(acct)) continue;
+
+      logStore.log('info', 'auth', `Background refresh: token expiring for ${acct.email}, refreshing...`);
+      try {
+        const ok = await ensureAccountFresh(acct);
+        if (ok) {
+          logStore.log('info', 'auth', `Background refresh: token renewed for ${acct.email}`);
+        } else {
+          logStore.log('warn', 'auth', `Background refresh: failed for ${acct.email}`);
+        }
+      } catch (err: any) {
+        logStore.log('error', 'auth', `Background refresh error for ${acct.email}: ${err.message}`);
+      }
+    }
+  };
+
+  setInterval(tick, BACKGROUND_REFRESH_INTERVAL_MS).unref();
 }

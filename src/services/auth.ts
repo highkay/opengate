@@ -26,7 +26,7 @@ import { config } from './configService.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 import { getActivePage } from './playwright.ts';
-import { ensureAccountFresh, needsRefresh } from './tokenRefresh.ts';
+import { ensureAccountFresh, needsRefresh, startBackgroundTokenRefresh } from './tokenRefresh.ts';
 
 export {
   addAccount,
@@ -53,7 +53,7 @@ export {
   setAccountDisabled,
   throttleAccount,
 } from './accountManager.ts';
-export { ensureAccountFresh, needsRefresh, tryRefreshToken } from './tokenRefresh.ts';
+export { ensureAccountFresh, needsRefresh, startBackgroundTokenRefresh, tryRefreshToken } from './tokenRefresh.ts';
 
 export function getAuthTokenMaxAgeMs(): number {
   return config.getInt('AUTH_TOKEN_MAX_AGE_MS', 28800000);
@@ -289,6 +289,8 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       acct.startupStatus = acct.state?.token && acct.state.expiresAt > Date.now() ? 'ready' : 'pending';
     }
     logStore.log('info', 'auth', successCount + '/' + accounts.length + ' accounts authenticated');
+
+    startBackgroundTokenRefresh();
 
     setupAccountWatcherImpl();
 

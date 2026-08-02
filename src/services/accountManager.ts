@@ -579,18 +579,12 @@ export function isAvailable(acct: AccountEntry): boolean {
   return true;
 }
 export async function pickAccount(excludeEmail?: string): Promise<AccountEntry | null> {
-  // No lock needed — all operations are synchronous and fast.
-  // Worst case for concurrent access: slightly imbalanced inFlight count,
-  // which is acceptable for load-balancing purposes.
   try {
     let available = accounts.filter(isAvailable);
     if (excludeEmail) {
       available = available.filter((a) => a.email !== excludeEmail);
     }
     if (available.length === 0) {
-      // All accounts are throttled or unauthenticated — return null instead
-      // of falling back to a throttled account (which would guaranteed fail).
-      // The caller should return a proper "all accounts exhausted" error.
       if (accounts.length === 0) {
         return null;
       }
@@ -611,6 +605,7 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
         break;
       }
     }
+
     if (!picked) return null;
     logStore.log(
       'debug',
@@ -619,7 +614,6 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
     );
     picked.lastUsed = Date.now();
     picked.inFlight++;
-    // Safety valve: reset if counter drifts unreasonably high
     if (picked.inFlight > 20) picked.inFlight = 0;
     return picked;
   } catch (err: any) {
