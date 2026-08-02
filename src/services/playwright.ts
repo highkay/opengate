@@ -1,5 +1,6 @@
 import { launch as cloakLaunch } from 'cloakbrowser';
 import { Browser, BrowserContext, Cookie, chromium, firefox, Page, webkit } from 'playwright';
+import { getChromiumLaunchOptions } from './browserRuntime.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_BX_V } from './qwen.ts';
 
@@ -160,10 +161,12 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
       case 'chromium':
       default:
         try {
+          const profileDir = `/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`;
           defaultBrowser = await cloakLaunch({
             headless,
             humanize: true,
             geoip: true,
+            userDataDir: profileDir,
             args: [
               '--disable-dev-shm-usage',
               '--no-sandbox',
@@ -177,21 +180,11 @@ export async function initPlaywright(headless = true, browserType: BrowserType =
               '--disable-translate',
               '--metrics-recording-only',
               '--disable-blink-features=AutomationControlled',
-              `--user-data-dir=/tmp/qwen-pw-${Math.random().toString(36).slice(2, 8)}`,
             ],
           });
         } catch (err) {
           logStore.log('warn', 'playwright', `cloakLaunch failed, falling back to chromium.launch: ${(err as Error).message}`);
-          defaultBrowser = await chromium.launch({
-            headless,
-            ignoreDefaultArgs: ['--enable-automation'],
-            args: [
-              '--disable-dev-shm-usage',
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
-              '--disable-blink-features=AutomationControlled',
-            ],
-          });
+          defaultBrowser = await chromium.launch(getChromiumLaunchOptions(true));
         }
         break;
     }
