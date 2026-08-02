@@ -18,7 +18,7 @@ import {
   loginViaTempContext,
 } from './loginHelpers.ts';
 import { logStore } from './logStore.ts';
-import { getActivePage, getBrowser, Mutex } from './playwright.ts';
+import { getActivePage, getBrowser, initPlaywright, Mutex } from './playwright.ts';
 
 export { clearLastLoginFailure, getLastLoginFailure, type LoginFailure };
 
@@ -54,6 +54,7 @@ export async function loginFresh(email: string, password: string, options: Login
       logStore.log('warn', 'auth', `Browser login failed for ${email}, trying temp context...`);
     }
 
+    await initPlaywright().catch(() => {});
     const browser = getBrowser();
     if (browser) {
       const tempResult = await loginViaTempContext(browser, email, hashedPassword, loginMutex);
