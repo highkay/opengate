@@ -4,9 +4,11 @@
  * bx-umidtoken is a long-lived device ID token (hours-days TTL).
  * It's returned by sg-wum.alibaba.com as a JS callback wrapping a base64 token.
  *
- * This is a pure-HTTP extraction — no browser or JS execution needed.
+ * Uses wreqFetch (Rust + BoringSSL) so proxy env vars are respected.
  * The endpoint returns: umx.wu('BASE64_TOKEN') or __fycb('BASE64_TOKEN')
  */
+
+import { wreqFetch } from './wreqFetch.ts';
 
 const WUM_URL = 'https://sg-wum.alibaba.com/w/wu.json';
 
@@ -15,7 +17,7 @@ const WUM_URL = 'https://sg-wum.alibaba.com/w/wu.json';
  * Cached via tokenCache with 4h TTL — callers should not cache on top of this.
  */
 export async function extractBxUmidtoken(): Promise<string> {
-  const response = await fetch(WUM_URL, {
+  const response = await wreqFetch(WUM_URL, {
     headers: {
       accept: '*/*',
       'accept-language': 'en-US,en;q=0.9',
