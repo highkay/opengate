@@ -1,4 +1,16 @@
 {
+  "qwen3-8-max": {
+    "max_context": 1000000,
+    "max_output": 131072,
+    "modalities": ["text", "image", "video"],
+    "fallback_chain": {
+      "primary": "qwen3-8-max",
+      "fallbacks": [
+        { "model": "qwen3-8-max-preview", "weight": 0.9, "health_threshold": 0.9 },
+        { "model": "qwen3-7-plus", "weight": 0.7, "health_threshold": 0.85 }
+      ]
+    }
+  },
   "qwen3-8-max-preview": {
     "max_context": 1000000,
     "max_output": 65536,
@@ -25,7 +37,7 @@
   },
   "qwen3-7-max": {
     "max_context": 1000000,
-    "max_output": 81920,
+    "max_output": 65536,
     "modalities": ["text"],
     "fallback_chain": {
       "primary": "qwen3-7-max",

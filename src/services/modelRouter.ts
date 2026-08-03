@@ -26,14 +26,14 @@ export const COMPAT_MODEL_ALIASES: Record<string, string> = {
   'qwen-turbo': 'qwen3.5-flash',
   'gpt-4-turbo': 'qwen3.7-plus',
   'o1-mini': 'qwen3.5-flash',
-  'claude-3-opus': 'qwen3.8-max-preview',
+  'claude-3-opus': 'qwen3.8-max',
   'gemini-2.5-flash': 'qwen3.5-flash',
   qwen: 'qwen3.7-plus',
   'qwen-plus': 'qwen3.7-plus',
   'deepseek-reasoner': 'qwen3.7-plus',
   'gpt-4o-mini': 'qwen3.5-flash',
-  'gpt-5': 'qwen3.8-max-preview',
-  'claude-opus-4-6': 'qwen3.8-max-preview',
+  'gpt-5': 'qwen3.8-max',
+  'claude-opus-4-6': 'qwen3.8-max',
   'qwen3-coder': 'qwen3-coder-plus',
 };
 
