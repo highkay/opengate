@@ -175,48 +175,61 @@ async function ensureAcwTcCookie(headers: Record<string, string>, proxy?: string
 
 const isPunishText = (text: string): boolean => PUNISH_PATTERN.test(text);
 
+interface WafCheck {
+  waf: boolean;
+  /** IP-level baxia punish body (200 + rgv587_flag/... markers), vs cookie-level WAF (302/403/HTML). */
+  punish: boolean;
+  response: Response;
+}
+
 /**
  * Detect WAF/punish responses. 302/403 are always WAF. 200 responses are WAF
  * when HTML, and — for non-stream requests — when the JSON body carries a
  * punish marker (200+JSON punish was the exact failure mode of the wreq era).
  *
+ * `punish` is true only for the IP-level baxia punish body (200 + punish JSON):
+ * browser recovery from the same IP cannot clear it, so callers fail fast.
+ * Cookie-level WAF (302/403/HTML) keeps the browser recovery path.
+ *
  * When the body must be consumed to decide, the response is reconstructed so
  * callers can still read it.
  */
-async function wafCheckResponse(response: Response, stream: boolean): Promise<{ waf: boolean; response: Response }> {
-  if (response.status === 302 || response.status === 403) return { waf: true, response };
+async function wafCheckResponse(response: Response, stream: boolean): Promise<WafCheck> {
+  if (response.status === 302 || response.status === 403) return { waf: true, punish: false, response };
   const ct = response.headers.get('content-type') || '';
 
   if (stream) {
-    if (ct.includes('text/html')) return { waf: true, response };
-    if (ct.includes('text/event-stream')) return { waf: false, response };
+    if (ct.includes('text/html')) return { waf: true, punish: false, response };
+    if (ct.includes('text/event-stream')) return { waf: false, punish: false, response };
     // JSON (or unknown) on a stream request — consume and classify (small payload)
     try {
       const text = await response.text();
-      if (isPunishText(text)) return { waf: true, response };
+      if (isPunishText(text)) return { waf: true, punish: true, response };
       return {
         waf: false,
+        punish: false,
         response: new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers }),
       };
     } catch {
-      return { waf: false, response };
+      return { waf: false, punish: false, response };
     }
   }
 
-  if (response.status === 200 && ct.includes('text/html')) return { waf: true, response };
+  if (response.status === 200 && ct.includes('text/html')) return { waf: true, punish: false, response };
   if (ct.includes('application/json')) {
     try {
       const text = await response.text();
-      if (isPunishText(text)) return { waf: true, response };
+      if (isPunishText(text)) return { waf: true, punish: true, response };
       return {
         waf: false,
+        punish: false,
         response: new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers }),
       };
     } catch {
-      return { waf: false, response };
+      return { waf: false, punish: false, response };
     }
   }
-  return { waf: false, response };
+  return { waf: false, punish: false, response };
 }
 
 export interface BrowserlessFetchOptions {
@@ -304,6 +317,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       logStore.log('warn', 'browserless', `WAF detected on ${url.split('?')[0]} — trying HTTP refresh first...`);
       const currentCookie = headers['cookie'] || '';
       let needsBrowserRefresh = true;
+      let punishDetected = check.punish;
 
       const freshAcwTc = await refreshAcwTcCookie(proxy);
       if (freshAcwTc) {
@@ -321,11 +335,19 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         const after = await wafCheckResponse(response, !!stream);
         response = after.response;
         needsBrowserRefresh = after.waf;
+        if (after.punish) punishDetected = true;
       }
 
       if (needsBrowserRefresh) {
         if (!allowBrowserRecovery) {
           throw new Error(`WAF challenge persists after HTTP cookie refresh for ${url.split('?')[0]}; browser recovery disabled`);
+        }
+        // IP-level punish (200 + baxia punish JSON): a Playwright browser from
+        // the same IP cannot clear it — verified repeatedly in production.
+        // Fail fast so the auth loop stops hammering and the IP can cool down.
+        // Cookie-level WAF (302/403/HTML) still uses browser recovery.
+        if (isNativeTransport() && punishDetected) {
+          throw new Error(`Aliyun WAF IP-level punish persists for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`);
         }
         logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
         const key = accountEmail || '_default_';
