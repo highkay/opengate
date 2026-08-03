@@ -16,7 +16,7 @@ const WUM_URL = 'https://sg-wum.alibaba.com/w/wu.json';
  * Extract bx-umidtoken from the sg-wum.alibaba.com endpoint.
  * Cached via tokenCache with 4h TTL — callers should not cache on top of this.
  */
-export async function extractBxUmidtoken(): Promise<string> {
+export async function extractBxUmidtoken(proxy?: string): Promise<string> {
   const response = await wreqFetch(WUM_URL, {
     headers: {
       accept: '*/*',
@@ -24,6 +24,7 @@ export async function extractBxUmidtoken(): Promise<string> {
       'cache-control': 'no-cache',
       pragma: 'no-cache',
     },
+    proxy,
   });
 
   if (!response.ok) {

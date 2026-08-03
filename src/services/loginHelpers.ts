@@ -338,6 +338,9 @@ async function loginFreshViaFetchOnce(
       signal: controller.signal,
       accountEmail: email,
       allowBrowserRecovery,
+      // Sign-in goes through the residential/SOCKS proxy to escape IP risk-control;
+      // chat requests stay direct (see config QWEN_PROXY, default socks5://127.0.0.1:1080).
+      proxy: process.env.QWEN_PROXY || 'socks5://127.0.0.1:1080',
     });
 
     const contentType = response.headers.get('content-type');
@@ -521,10 +524,14 @@ export async function loginViaTempContext(
     let capturedToken: string | null = null;
     let capturedRefresh: string | null = null;
 
-    // Intercept signin API to capture token from BOTH JSON body AND set-cookie headers
-    await page.route('**/api/v2/auths/signin', async (route) => {
+    // Observe the signin response instead of route.fetch(): Playwright's
+    // route.fetch() crashes with ERR_INVALID_URL when the server returns a
+    // relative URL (e.g. "/api/v2/auths/signin") because _parseSetCookieHeader
+    // runs new URL() on it. Passive observation lets the page JS handle its own
+    // login flow while we copy the token from JSON body + set-cookie headers.
+    const onSigninResponse = async (response: import('playwright').Response) => {
       try {
-        const response = await route.fetch();
+        if (!response.url().includes('/api/v2/auths/signin')) return;
 
         // Try to extract token from JSON response body first (fastest path)
         try {
@@ -534,12 +541,11 @@ export async function loginViaTempContext(
           if (jsonToken && !capturedToken) capturedToken = jsonToken;
           if (jsonRefresh && !capturedRefresh) capturedRefresh = jsonRefresh;
         } catch {
-          logStore.log('warn', 'auth', 'signin route fetch returned non-JSON response');
+          logStore.log('warn', 'auth', 'signin response returned non-JSON body');
         }
 
         // Also check set-cookie headers as fallback
-        const setCookies = response
-          .headersArray()
+        const setCookies = (await response.headersArray())
           .filter((h) => h.name.toLowerCase() === 'set-cookie')
           .map((h) => h.value);
         for (const cookie of setCookies) {
@@ -548,13 +554,11 @@ export async function loginViaTempContext(
           const refreshMatch = cookie.match(/\brefresh_token=([^;]+)/);
           if (refreshMatch && !capturedRefresh) capturedRefresh = refreshMatch[1];
         }
-
-        await route.fulfill({ response });
-      } catch {
-        // If route.fetch fails, let the request pass through normally
-        await route.continue();
+      } catch (err: any) {
+        logStore.log('warn', 'auth', `signin response capture error for ${email}: ${err.message}`);
       }
-    });
+    };
+    context.on('response', onSigninResponse);
 
     try {
       await page.goto(`${QWEN_CHAT_URL}/auth`, { waitUntil: 'domcontentloaded', timeout: 20_000 });
@@ -590,7 +594,7 @@ export async function loginViaTempContext(
       }
     }
 
-    await page.unroute('**/api/v2/auths/signin');
+    context.off('response', onSigninResponse);
 
     if (capturedToken) {
       return {

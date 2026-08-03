@@ -103,6 +103,8 @@ export interface WreqFetchOptions {
   impersonate?: string;
   timeout?: number;
   debugLogDir?: string;
+  /** SOCKS/HTTP proxy for this request, e.g. socks5://127.0.0.1:1080. Overrides env proxies. */
+  proxy?: string;
 }
 
 export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Promise<Response> {
@@ -124,6 +126,7 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
         impersonate,
         timeout,
         debugLogDir: options.debugLogDir,
+        proxy: options.proxy,
       }),
       signal: options.signal,
     });
@@ -139,7 +142,7 @@ export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Pr
     response = await fetch(`${baseUrl2}/`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ method, url, headers, body: body || undefined, stream, impersonate, timeout }),
+      body: JSON.stringify({ method, url, headers, body: body || undefined, stream, impersonate, timeout, proxy: options.proxy }),
       signal: options.signal,
     });
   }

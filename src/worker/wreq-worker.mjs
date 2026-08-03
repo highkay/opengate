@@ -63,7 +63,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+      const proxy = spec.proxy || process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
       const session = await wreq.createSession({
         browser: impersonate,
         os: 'linux',

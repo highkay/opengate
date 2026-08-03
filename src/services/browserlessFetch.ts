@@ -38,12 +38,14 @@ export interface BrowserlessFetchOptions {
   allowBrowserRecovery?: boolean;
   /** Keep the session alive for streaming. Default false — session is closed after response. */
   stream?: boolean;
+  /** SOCKS/HTTP proxy for this request (e.g. socks5://127.0.0.1:1080). Overrides env proxies. */
+  proxy?: string;
 }
 
 /** Ensure bx-umidtoken is in headers, fetching from cache or sg-wum endpoint. */
-async function ensureBxUmidtoken(headers: Record<string, string>): Promise<void> {
+async function ensureBxUmidtoken(headers: Record<string, string>, proxy?: string): Promise<void> {
   if (headers['bx-umidtoken']) return;
-  const token = await tokenCache.getOrSet('bx-umidtoken', extractBxUmidtoken, BX_UMIDTOKEN_TTL_MS);
+  const token = await tokenCache.getOrSet('bx-umidtoken', () => extractBxUmidtoken(proxy), BX_UMIDTOKEN_TTL_MS);
   headers['bx-umidtoken'] = token;
 }
 
@@ -53,13 +55,14 @@ let acwTcRefreshTimer: ReturnType<typeof setInterval> | null = null;
 const ACW_TC_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 
 /** Fetch acw_tc cookie from the Qwen root page via wreq worker. */
-async function refreshAcwTcCookie(): Promise<string | null> {
+async function refreshAcwTcCookie(proxy?: string): Promise<string | null> {
   try {
     logEvent('refreshAcwTcCookie', 'fetching acw_tc from root');
     const resp = await wreqFetch(QWEN_API_BASE, {
       method: 'GET',
       headers: { accept: 'text/html,application/xhtml+xml' },
       debugLogDir: process.env.DEBUG_IMPERS_DIR,
+      proxy,
     });
     logFetchCall('refreshAcwTcCookie', QWEN_API_BASE, 'GET', resp.status);
     let acwTc: string | null = null;
@@ -96,12 +99,12 @@ function startAcwTcRefresh(): void {
 }
 
 /** Inject acw_tc cookie into headers from cache. */
-async function ensureAcwTcCookie(headers: Record<string, string>): Promise<void> {
+async function ensureAcwTcCookie(headers: Record<string, string>, proxy?: string): Promise<void> {
   startAcwTcRefresh();
 
   let acwTc = tokenCache.get('acw_tc') ?? null;
   if (!acwTc) {
-    acwTc = await refreshAcwTcCookie();
+    acwTc = await refreshAcwTcCookie(proxy);
   }
   if (acwTc) {
     headers['cookie'] = mergeCookieHeaders(headers['cookie'], `acw_tc=${acwTc}`);
@@ -136,10 +139,10 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     return globalThis.fetch(url, { method, headers, body });
   }
 
-  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true } = options;
+  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true, proxy } = options;
 
   // Auto-inject bx tokens
-  await ensureBxUmidtoken(headers);
+  await ensureBxUmidtoken(headers, proxy);
 
   if (!headers['bx-v']) headers['bx-v'] = '2.5.36';
   if (!headers['bx-et']) headers['bx-et'] = 'nosgn';
@@ -170,7 +173,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     }
   }
 
-  await ensureAcwTcCookie(headers);
+  await ensureAcwTcCookie(headers, proxy);
 
   const startTime = Date.now();
 
@@ -184,6 +187,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       signal,
       stream: !!stream,
       debugLogDir: process.env.DEBUG_IMPERS_DIR,
+      proxy,
     });
     logFetchCall('browserlessFetch', url, method, response.status);
 
@@ -194,7 +198,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       const currentCookie = headers['cookie'] || '';
       let needsBrowserRefresh = true;
 
-      const freshAcwTc = await refreshAcwTcCookie();
+      const freshAcwTc = await refreshAcwTcCookie(proxy);
       if (freshAcwTc) {
         headers['cookie'] = mergeCookieHeaders(currentCookie, `acw_tc=${freshAcwTc}`);
         logEvent('browserlessFetch', 'HTTP cookie retry', { url: url.split('?')[0] });
@@ -205,6 +209,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
           signal,
           stream: !!stream,
           debugLogDir: process.env.DEBUG_IMPERS_DIR,
+          proxy,
         });
         logFetchCall('browserlessFetch.http-cookie-retry', url, method, response.status);
         needsBrowserRefresh = wafCheck(response);
@@ -229,7 +234,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
           tokenCache.delete('bx-ua');
           tokenCache.delete('bx-pp');
           tokenCache.delete('acw_tc');
-          await ensureBxUmidtoken(headers);
+          await ensureBxUmidtoken(headers, proxy);
           headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
           const pp = await generateBxPp(body);
           if (pp) headers['bx-pp'] = pp;
@@ -244,6 +249,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
             signal,
             stream: !!stream,
             debugLogDir: process.env.DEBUG_IMPERS_DIR,
+            proxy,
           });
           logFetchCall('browserlessFetch.retry', url, method, response.status);
           if (wafCheck(response)) {

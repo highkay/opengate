@@ -206,6 +206,8 @@ export class SessionPool {
         cookie: cookieStr,
         origin: QWEN_API_BASE,
         referer: 'https://chat.qwen.ai/',
+        // Required by Aliyun WAF — missing x-request-id triggers the baxia challenge (proven 4/4).
+        'x-request-id': crypto.randomUUID(),
       },
       body: sessionBody,
       accountEmail: email,
