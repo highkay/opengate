@@ -347,7 +347,9 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         // Fail fast so the auth loop stops hammering and the IP can cool down.
         // Cookie-level WAF (302/403/HTML) still uses browser recovery.
         if (isNativeTransport() && punishDetected) {
-          throw new Error(`Aliyun WAF IP-level punish persists for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`);
+          throw new Error(
+            `Aliyun WAF IP-level punish persists for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`,
+          );
         }
         logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
         const key = accountEmail || '_default_';
