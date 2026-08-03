@@ -19,8 +19,11 @@
  *
  * WAF/punish detection covers 302 / 403 / 200+text/html AND 200+JSON punish
  * bodies (rgv587_flag / bixi.alicdn.com/punish / RGV587_ERROR /
- * FAIL_SYS_USER_VALIDATE). Punish responses trigger acw_tc refresh + retry,
- * then Playwright cookie recovery.
+ * FAIL_SYS_USER_VALIDATE). WAF responses trigger acw_tc refresh + one retry;
+ * if still WAF, the native transport fails fast (an IP-level block — baxia
+ * punish or the aliyun_waf JS challenge page — cannot be cleared by a browser
+ * from the same IP). Playwright cookie recovery remains only for the legacy
+ * wreq transport (QWEN_TRANSPORT=wreq).
  */
 
 import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
@@ -177,7 +180,7 @@ const isPunishText = (text: string): boolean => PUNISH_PATTERN.test(text);
 
 interface WafCheck {
   waf: boolean;
-  /** IP-level baxia punish body (200 + rgv587_flag/... markers), vs cookie-level WAF (302/403/HTML). */
+  /** Diagnostic only: true when body is baxia punish JSON (rgv587_flag/...) vs the aliyun_waf JS challenge page or 302/403. */
   punish: boolean;
   response: Response;
 }
@@ -187,9 +190,8 @@ interface WafCheck {
  * when HTML, and — for non-stream requests — when the JSON body carries a
  * punish marker (200+JSON punish was the exact failure mode of the wreq era).
  *
- * `punish` is true only for the IP-level baxia punish body (200 + punish JSON):
- * browser recovery from the same IP cannot clear it, so callers fail fast.
- * Cookie-level WAF (302/403/HTML) keeps the browser recovery path.
+ * `punish` is a diagnostic flag (baxia punish JSON). The recovery decision is
+ * transport-level in browserlessFetch, not punish-level.
  *
  * When the body must be consumed to decide, the response is reconstructed so
  * callers can still read it.
@@ -313,11 +315,10 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     let check = await wafCheckResponse(response, !!stream);
     response = check.response;
     if (check.waf) {
-      logEvent('browserlessFetch', 'WAF detected', { url: url.split('?')[0], status: response.status });
+      logEvent('browserlessFetch', 'WAF detected', { url: url.split('?')[0], status: response.status, punish: check.punish });
       logStore.log('warn', 'browserless', `WAF detected on ${url.split('?')[0]} — trying HTTP refresh first...`);
       const currentCookie = headers['cookie'] || '';
       let needsBrowserRefresh = true;
-      let punishDetected = check.punish;
 
       const freshAcwTc = await refreshAcwTcCookie(proxy);
       if (freshAcwTc) {
@@ -335,20 +336,24 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         const after = await wafCheckResponse(response, !!stream);
         response = after.response;
         needsBrowserRefresh = after.waf;
-        if (after.punish) punishDetected = true;
       }
 
       if (needsBrowserRefresh) {
         if (!allowBrowserRecovery) {
           throw new Error(`WAF challenge persists after HTTP cookie refresh for ${url.split('?')[0]}; browser recovery disabled`);
         }
-        // IP-level punish (200 + baxia punish JSON): a Playwright browser from
-        // the same IP cannot clear it — verified repeatedly in production.
-        // Fail fast so the auth loop stops hammering and the IP can cool down.
-        // Cookie-level WAF (302/403/HTML) still uses browser recovery.
-        if (isNativeTransport() && punishDetected) {
+        // Native fetch passes the WAF whenever the IP is clean (verified
+        // repeatedly — signin/chats/new/chat/completions all 200 direct). A WAF
+        // response that survives the HTTP acw_tc refresh is therefore an
+        // IP-level block — baxia punish JSON (rgv587_flag) or the aliyun_waf
+        // JS challenge page (200 + text/html) — that a Playwright browser from
+        // the same IP cannot clear: 10+ browser recoveries in production, 0
+        // successes. Escalating only adds traffic that extends the punishment.
+        // Fail fast so the auth loop backs off and the IP can cool down.
+        // Playwright recovery stays for the legacy wreq transport only.
+        if (isNativeTransport()) {
           throw new Error(
-            `Aliyun WAF IP-level punish persists for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`,
+            `Aliyun WAF challenge persists after HTTP cookie refresh for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`,
           );
         }
         logStore.log('warn', 'browserless', `HTTP refresh failed — trying Playwright browser...`);
