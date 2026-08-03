@@ -102,6 +102,12 @@ async function ensureBxUmidtoken(headers: Record<string, string>, proxy?: string
 
 // ─── acw_tc cookie (Alibaba WAF) ────────────────────────────────────────────
 
+/** Cache key per transport path: the acw_tc cookie is bound to the exit IP, so
+ * the login proxy's acw_tc must never leak into the direct chat path's cache. */
+function acwTcCacheKey(proxy?: string): string {
+  return proxy ? `acw_tc:proxy:${proxy}` : 'acw_tc';
+}
+
 let acwTcRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let acwTcRefreshInFlight: Promise<string | null> | null = null;
 
@@ -135,7 +141,7 @@ async function doRefreshAcwTcCookie(proxy?: string): Promise<string | null> {
       if (match) acwTc = match[1];
     }
     if (acwTc) {
-      tokenCache.set('acw_tc', acwTc, ACW_TC_REFRESH_MS * 2);
+      tokenCache.set(acwTcCacheKey(proxy), acwTc, ACW_TC_REFRESH_MS * 2);
       logStore.log('debug', 'browserless', 'acw_tc cookie refreshed');
       logEvent('refreshAcwTcCookie', 'acw_tc obtained');
     } else {
@@ -165,7 +171,7 @@ function startAcwTcRefresh(): void {
 async function ensureAcwTcCookie(headers: Record<string, string>, proxy?: string): Promise<void> {
   startAcwTcRefresh();
 
-  let acwTc = tokenCache.get('acw_tc') ?? null;
+  let acwTc = tokenCache.get(acwTcCacheKey(proxy)) ?? null;
   if (!acwTc) {
     acwTc = await refreshAcwTcCookie(proxy);
   }
@@ -370,7 +376,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
           headers['cookie'] = mergeCookieHeaders(currentCookie, headers['cookie'], freshCookies);
           tokenCache.delete('bx-ua');
           tokenCache.delete('bx-pp');
-          tokenCache.delete('acw_tc');
+          tokenCache.delete(acwTcCacheKey(proxy));
           await ensureBxUmidtoken(headers, proxy);
           headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
           const pp = await generateBxPp(body);

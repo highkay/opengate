@@ -24,6 +24,9 @@ export async function tryRefreshToken(acct: AccountEntry, fetcher: typeof browse
     const resp = await fetcher(`${QWEN_CHAT_URL}/api/v2/auths/refresh`, {
       method: 'POST',
       body: JSON.stringify({ refresh_token: acct.state.refreshToken }),
+      // Refresh is part of the login path — route through the login-dedicated
+      // dynamic proxy when configured so it also bypasses the IP-level WAF.
+      proxy: process.env.QWEN_LOGIN_PROXY || process.env.QWEN_PROXY || undefined,
     });
 
     if (!resp.ok) return false;

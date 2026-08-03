@@ -338,10 +338,11 @@ async function loginFreshViaFetchOnce(
       signal: controller.signal,
       accountEmail: email,
       allowBrowserRecovery,
-      // Direct connection is verified to pass the WAF for signin (2026-08-04);
-      // the old SOCKS default (socks5://127.0.0.1:1080) is unsupported by Bun's
-      // native fetch and its exit IP mismatched chat's direct bx/acw_tc cache.
-      proxy: process.env.QWEN_PROXY || undefined,
+      // Login-dedicated dynamic proxy (QWEN_LOGIN_PROXY) rotates the exit IP,
+      // bypassing the Aliyun WAF IP-level punishment that blocks direct signin
+      // during a challenge window. Falls back to the generic QWEN_PROXY, then
+      // direct (verified to pass the WAF when the IP is clean, 2026-08-04).
+      proxy: process.env.QWEN_LOGIN_PROXY || process.env.QWEN_PROXY || undefined,
     });
 
     const contentType = response.headers.get('content-type');
