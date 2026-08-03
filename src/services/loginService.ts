@@ -41,8 +41,15 @@ export async function loginFresh(email: string, password: string, options: Login
     }
   }
 
+  // IP-level WAF block: same-IP browser can't clear it, and launching one extends the punishment — fail fast
+  const fetchFailure = getLastLoginFailure(email);
+  const wafBlocked = fetchFailure?.code === 'waf';
+  if (wafBlocked) {
+    logStore.log('warn', 'auth', `Skipping browser fallback for ${email}: IP-level WAF block detected — cooldown required`);
+  }
+
   // Fallback to browser strategies if fetch fails and a browser session exists
-  if (!process.env.TEST_MOCK_PLAYWRIGHT && options.allowBrowserFallback !== false) {
+  if (!process.env.TEST_MOCK_PLAYWRIGHT && !wafBlocked && options.allowBrowserFallback !== false) {
     const activePage = getActivePage();
     if (activePage) {
       const browserResult = await loginFreshViaBrowser(email, hashedPassword, loginMutex);
