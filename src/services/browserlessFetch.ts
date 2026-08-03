@@ -1,14 +1,26 @@
 /**
- * browserlessFetch — wreq-js worker wrapper for browserless TLS/HTTP2 impersonation.
+ * browserlessFetch — browserless requests to Qwen API with anti-WAF header stack.
  *
- * Uses a Node.js sidecar worker running wreq-js (Rust + BoringSSL) with
- * Chrome 142 fingerprint to bypass Alibaba WAF.
+ * PRIMARY TRANSPORT: Bun native fetch (globalThis.fetch). Verified 2026-08-04 to
+ * pass Aliyun WAF with the full bx/acw_tc header stack — signin, chats/new and
+ * chat/completions all return 200 (success) when direct.
  *
- * Manages:
- *   - TLS/HTTP2 impersonation (Chrome 142 via wreq worker)
- *   - bx-umidtoken auto-extraction + caching
- *   - bx-v / bx-et static headers
- *   - WAF detection + recovery via Playwright cookie refresh
+ * LEGACY TRANSPORT: wreq-js worker (chrome_142 fingerprint via Rust + BoringSSL).
+ * Aliyun WAF now flags this fingerprint and returns a 200 + punish JSON body
+ * ({"rgv587_flag":"sm",...}), which the old wafCheck() missed because it only
+ * looked at 302/403/200+text/html. Kept behind QWEN_TRANSPORT=wreq for A/B
+ * comparison / rollback.
+ *
+ * Header stack (same for both transports):
+ *   - bx-umidtoken: auto-extracted from sg-wum.alibaba.com + cached (4h TTL)
+ *   - bx-v / bx-et: static anti-bot headers
+ *   - bx-ua / bx-pp: generated per request
+ *   - acw_tc cookie: from the chat.qwen.ai root page, refreshed periodically
+ *
+ * WAF/punish detection covers 302 / 403 / 200+text/html AND 200+JSON punish
+ * bodies (rgv587_flag / bixi.alicdn.com/punish / RGV587_ERROR /
+ * FAIL_SYS_USER_VALIDATE). Punish responses trigger acw_tc refresh + retry,
+ * then Playwright cookie recovery.
  */
 
 import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
@@ -20,26 +32,62 @@ import { QWEN_API_BASE } from './qwen.ts';
 import { tokenCache } from './tokenCache.ts';
 import { disposeWreqWorker, wreqFetch } from './wreqFetch.ts';
 
-// wreq-js (BoringSSL) is the only transport — bypasses library-level WAF
-// detection that impers (libcurl/OpenSSL) couldn't.
-
 // Single-flight guard: one cookie refresh per account at a time
 const cookieRefreshInFlight = new Map<string, Promise<string | null>>();
 const BX_UMIDTOKEN_TTL_MS = 4 * 60 * 60 * 1000;
 const BX_UA_TTL_MS = 15 * 60 * 1000;
+const ACW_TC_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 
-export interface BrowserlessFetchOptions {
-  method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  accountEmail?: string;
-  signal?: AbortSignal;
-  /** Allow Playwright cookie recovery after HTTP-only WAF recovery fails. Default true. */
-  allowBrowserRecovery?: boolean;
-  /** Keep the session alive for streaming. Default false — session is closed after response. */
-  stream?: boolean;
-  /** SOCKS/HTTP proxy for this request (e.g. socks5://127.0.0.1:1080). Overrides env proxies. */
-  proxy?: string;
+/** Aliyun baxia punish / challenge markers appearing in 200-OK JSON bodies. */
+const PUNISH_PATTERN = /rgv587_flag|bixi\.alicdn\.com\/punish|RGV587_ERROR|FAIL_SYS_USER_VALIDATE/;
+
+/** Transport selection: native Bun fetch by default; wreq only when forced via env. */
+function isNativeTransport(): boolean {
+  return process.env.QWEN_TRANSPORT !== 'wreq';
+}
+
+/**
+ * Normalize a proxy for the native transport. Bun's fetch `proxy` option only
+ * accepts http(s) proxies; a socks5 proxy is ignored (direct) with a warning —
+ * direct connections are verified to pass the WAF, socks5/WARP exits are not.
+ */
+function normalizeProxy(proxy?: string): string | undefined {
+  if (!proxy) return undefined;
+  if (/^https?:\/\//i.test(proxy)) return proxy;
+  logStore.log('warn', 'browserless', `proxy ${proxy} unsupported by native transport — falling back to direct`);
+  return undefined;
+}
+
+/** Bun native fetch with optional http(s) proxy. */
+async function nativeFetch(
+  url: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; proxy?: string },
+): Promise<Response> {
+  const { method = 'GET', headers = {}, body, signal, proxy } = options;
+  const fetchInit: RequestInit = { method, headers, body, signal };
+  const normalized = normalizeProxy(proxy);
+  if (normalized) (fetchInit as any).proxy = normalized;
+  return globalThis.fetch(url, fetchInit);
+}
+
+/** Shared dispatch: native fetch (default) or legacy wreq worker. */
+async function transportFetch(
+  url: string,
+  options: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal; stream?: boolean; proxy?: string },
+): Promise<Response> {
+  const { method = 'GET', headers = {}, body, signal, stream = false, proxy } = options;
+  if (isNativeTransport()) {
+    return nativeFetch(url, { method, headers, body, signal, proxy });
+  }
+  return wreqFetch(url, {
+    method,
+    headers,
+    body,
+    signal,
+    stream,
+    debugLogDir: process.env.DEBUG_IMPERS_DIR,
+    proxy,
+  });
 }
 
 /** Ensure bx-umidtoken is in headers, fetching from cache or sg-wum endpoint. */
@@ -52,16 +100,28 @@ async function ensureBxUmidtoken(headers: Record<string, string>, proxy?: string
 // ─── acw_tc cookie (Alibaba WAF) ────────────────────────────────────────────
 
 let acwTcRefreshTimer: ReturnType<typeof setInterval> | null = null;
-const ACW_TC_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
+let acwTcRefreshInFlight: Promise<string | null> | null = null;
 
-/** Fetch acw_tc cookie from the Qwen root page via wreq worker. */
-async function refreshAcwTcCookie(proxy?: string): Promise<string | null> {
+/**
+ * Fetch acw_tc cookie from the Qwen root page via native fetch.
+ * Single-flight: concurrent callers (immediate ensure + preload timer) share one
+ * root request — back-to-back root GETs just before an API POST were observed to
+ * trip the WAF into resetting the connection (ECONNRESET on signin).
+ */
+function refreshAcwTcCookie(proxy?: string): Promise<string | null> {
+  if (acwTcRefreshInFlight) return acwTcRefreshInFlight;
+  acwTcRefreshInFlight = doRefreshAcwTcCookie(proxy).finally(() => {
+    acwTcRefreshInFlight = null;
+  });
+  return acwTcRefreshInFlight;
+}
+
+async function doRefreshAcwTcCookie(proxy?: string): Promise<string | null> {
   try {
     logEvent('refreshAcwTcCookie', 'fetching acw_tc from root');
-    const resp = await wreqFetch(QWEN_API_BASE, {
+    const resp = await nativeFetch(QWEN_API_BASE, {
       method: 'GET',
       headers: { accept: 'text/html,application/xhtml+xml' },
-      debugLogDir: process.env.DEBUG_IMPERS_DIR,
       proxy,
     });
     logFetchCall('refreshAcwTcCookie', QWEN_API_BASE, 'GET', resp.status);
@@ -111,24 +171,67 @@ async function ensureAcwTcCookie(headers: Record<string, string>, proxy?: string
   }
 }
 
-// ─── WAF check ──────────────────────────────────────────────────────────────
+// ─── WAF / punish check ─────────────────────────────────────────────────────
 
-const wafCheck = (r: Response): boolean => {
-  if (r.status === 302) return true;
-  if (r.status === 403) return true;
-  if (r.status === 200) {
-    try {
-      const ct = r.headers.get('content-type') || '';
-      if (ct.includes('text/html')) return true;
-    } catch {
-      /* ignore */
-    }
-  }
-  return false;
-};
+const isPunishText = (text: string): boolean => PUNISH_PATTERN.test(text);
 
 /**
- * Make a browserless HTTP request to Qwen API.
+ * Detect WAF/punish responses. 302/403 are always WAF. 200 responses are WAF
+ * when HTML, and — for non-stream requests — when the JSON body carries a
+ * punish marker (200+JSON punish was the exact failure mode of the wreq era).
+ *
+ * When the body must be consumed to decide, the response is reconstructed so
+ * callers can still read it.
+ */
+async function wafCheckResponse(response: Response, stream: boolean): Promise<{ waf: boolean; response: Response }> {
+  if (response.status === 302 || response.status === 403) return { waf: true, response };
+  const ct = response.headers.get('content-type') || '';
+
+  if (stream) {
+    if (ct.includes('text/html')) return { waf: true, response };
+    if (ct.includes('text/event-stream')) return { waf: false, response };
+    // JSON (or unknown) on a stream request — consume and classify (small payload)
+    try {
+      const text = await response.text();
+      if (isPunishText(text)) return { waf: true, response };
+      return {
+        waf: false,
+        response: new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers }),
+      };
+    } catch {
+      return { waf: false, response };
+    }
+  }
+
+  if (response.status === 200 && ct.includes('text/html')) return { waf: true, response };
+  if (ct.includes('application/json')) {
+    try {
+      const text = await response.text();
+      if (isPunishText(text)) return { waf: true, response };
+      return {
+        waf: false,
+        response: new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers }),
+      };
+    } catch {
+      return { waf: false, response };
+    }
+  }
+  return { waf: false, response };
+}
+
+export interface BrowserlessFetchOptions {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  accountEmail?: string;
+  signal?: AbortSignal;
+  stream?: boolean;
+  allowBrowserRecovery?: boolean;
+  proxy?: string;
+}
+
+/**
+ * Make a browserless request to the Qwen API.
  *
  * Returns a standard Web API Response object.
  * Use `response.body.getReader()` for SSE streaming.
@@ -154,7 +257,10 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     } else {
       try {
         const generated = await generateBxUa();
-        if (generated) headers['bx-ua'] = generated;
+        if (generated) {
+          headers['bx-ua'] = generated;
+          tokenCache.set('bx-ua', generated, BX_UA_TTL_MS);
+        }
       } catch {
         /* fallback */
       }
@@ -177,22 +283,23 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
 
   const startTime = Date.now();
 
-  // ─── Initial request via wreq worker ─────────────────────────────────
+  // ─── Initial request ───────────────────────────────────────────────
   try {
     logFetchCall('browserlessFetch', url, method);
-    let response = await wreqFetch(url, {
+    let response = await transportFetch(url, {
       method,
       headers,
       body,
       signal,
       stream: !!stream,
-      debugLogDir: process.env.DEBUG_IMPERS_DIR,
       proxy,
     });
     logFetchCall('browserlessFetch', url, method, response.status);
 
     // ─── WAF detection + recovery ─────────────────────────────────────
-    if (wafCheck(response)) {
+    let check = await wafCheckResponse(response, !!stream);
+    response = check.response;
+    if (check.waf) {
       logEvent('browserlessFetch', 'WAF detected', { url: url.split('?')[0], status: response.status });
       logStore.log('warn', 'browserless', `WAF detected on ${url.split('?')[0]} — trying HTTP refresh first...`);
       const currentCookie = headers['cookie'] || '';
@@ -202,17 +309,18 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       if (freshAcwTc) {
         headers['cookie'] = mergeCookieHeaders(currentCookie, `acw_tc=${freshAcwTc}`);
         logEvent('browserlessFetch', 'HTTP cookie retry', { url: url.split('?')[0] });
-        response = await wreqFetch(url, {
+        response = await transportFetch(url, {
           method,
           headers,
           body,
           signal,
           stream: !!stream,
-          debugLogDir: process.env.DEBUG_IMPERS_DIR,
           proxy,
         });
         logFetchCall('browserlessFetch.http-cookie-retry', url, method, response.status);
-        needsBrowserRefresh = wafCheck(response);
+        const after = await wafCheckResponse(response, !!stream);
+        response = after.response;
+        needsBrowserRefresh = after.waf;
       }
 
       if (needsBrowserRefresh) {
@@ -242,17 +350,18 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
 
           logEvent('browserlessFetch', 'WAF retry', { url: url.split('?')[0] });
           logFetchCall('browserlessFetch.retry', url, method);
-          response = await wreqFetch(url, {
+          response = await transportFetch(url, {
             method,
             headers,
             body,
             signal,
             stream: !!stream,
-            debugLogDir: process.env.DEBUG_IMPERS_DIR,
             proxy,
           });
           logFetchCall('browserlessFetch.retry', url, method, response.status);
-          if (wafCheck(response)) {
+          const after = await wafCheckResponse(response, !!stream);
+          response = after.response;
+          if (after.waf) {
             throw new Error(`WAF challenge persists after cookie refresh for ${url.split('?')[0]}`);
           }
         }
