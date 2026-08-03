@@ -545,9 +545,7 @@ export async function loginViaTempContext(
         }
 
         // Also check set-cookie headers as fallback
-        const setCookies = (await response.headersArray())
-          .filter((h) => h.name.toLowerCase() === 'set-cookie')
-          .map((h) => h.value);
+        const setCookies = (await response.headersArray()).filter((h) => h.name.toLowerCase() === 'set-cookie').map((h) => h.value);
         for (const cookie of setCookies) {
           const tokenMatch = cookie.match(/\btoken=([^;]+)/);
           if (tokenMatch && !capturedToken) capturedToken = tokenMatch[1];
