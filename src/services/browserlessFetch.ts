@@ -252,6 +252,17 @@ export interface BrowserlessFetchOptions {
 }
 
 /**
+ * Default proxy for business (chat) traffic. Login/signin/refresh passes its
+ * own explicit proxy (QWEN_LOGIN_PROXY); business calls (chats/new,
+ * chat/completions, uploads, delete) used to go direct from the host IP.
+ * Route them through the same rotating exit IP so Aliyun WAF's IP-level
+ * frequency control sees a distributed source instead of one hot host IP.
+ */
+function defaultBusinessProxy(): string | undefined {
+  return process.env.QWEN_CHAT_PROXY || process.env.QWEN_PROXY || process.env.QWEN_LOGIN_PROXY || undefined;
+}
+
+/**
  * Make a browserless request to the Qwen API.
  *
  * Returns a standard Web API Response object.
@@ -263,7 +274,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     return globalThis.fetch(url, { method, headers, body });
   }
 
-  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true, proxy } = options;
+  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true, proxy = defaultBusinessProxy() } = options;
 
   // Auto-inject bx tokens
   await ensureBxUmidtoken(headers, proxy);
