@@ -38,7 +38,8 @@ The server runs on `http://localhost:26405` by default. Configure via `bun run s
 | CI quality gate | `.github/workflows/ci.yml` — biome, `tsc --noEmit`, `bun test` |
 | Image build | `.github/workflows/docker-ghcr.yml` — builds **`Dockerfile`**, pushes to GHCR |
 | Triggers | Push to `main` when `Dockerfile` / `package.json` / `bun.lock` / `src/**` / the workflow file change; or `workflow_dispatch` |
-| Registry | `ghcr.io/highkay/opengate` |
+| Registry | `ghcr.io/highkay/opengate` (push) |
+| Pull mirror | `ghcr.sparkcr.cn/highkay/opengate` — GitHub GHCR mirror; **use for pulls on this host** (`ghcr.io` is slow/unreliable from here, `docker pull` often hangs on large layers; the mirror is a read-through proxy of `ghcr.io`, so CI publish flow is unchanged) |
 
 **Tags:**
 
@@ -62,7 +63,7 @@ Example `docker-compose.yml`:
 ```yaml
 services:
   qwen2api:
-    image: ghcr.io/highkay/opengate:sha-e1b61dd   # pin to a CI-built SHA
+    image: ghcr.sparkcr.cn/highkay/opengate:sha-e1b61dd   # pin to a CI-built SHA (pull via ghcr.sparkcr.cn mirror)
     container_name: qwen2api
     restart: unless-stopped
     init: true
@@ -141,12 +142,11 @@ Then open `http://127.0.0.1:7900/vnc.html?autoconnect=true&resize=remote`, enter
 
 ```bash
 # After GitHub Actions "Docker GHCR" succeeds for commit <short>
-docker login ghcr.io   # if package is private
-docker pull ghcr.io/highkay/opengate:sha-<short>
-docker pull ghcr.io/highkay/opengate:latest
+# Pull via the mirror (fast/stable on this host), not ghcr.io directly:
+docker pull ghcr.sparkcr.cn/highkay/opengate:sha-<short>
 
 cd /home/admin/Qwen2api
-# set image: ghcr.io/highkay/opengate:sha-<short>
+# set image: ghcr.sparkcr.cn/highkay/opengate:sha-<short>
 echo '<short>' > OPENGATE_COMMIT
 docker compose up -d --force-recreate
 curl -sS http://127.0.0.1:7860/ping
