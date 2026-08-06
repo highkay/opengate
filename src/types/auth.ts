@@ -26,4 +26,16 @@ export interface AccountEntry {
   startupStatus?: 'pending' | 'initializing' | 'connecting' | 'ready';
   /** If true, account is excluded from request routing */
   disabled?: boolean;
+  /**
+   * Per-account sticky proxy URL.
+   * Format: http://Default.{account}:password@host:port
+   * When set, all traffic for this account routes through this proxy
+   * (same exit IP for the session lifetime).
+   */
+  proxyUrl?: string;
+  /**
+   * Proxy health flag. When true, the current proxy is degraded/punished and
+   * must be rebuilt (new session → new exit IP) before the next request.
+   */
+  proxyFailed?: boolean;
 }
