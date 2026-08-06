@@ -26,6 +26,7 @@ import { config } from './configService.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 import { getActivePage } from './playwright.ts';
+import { probeAllAccounts } from './proxyManager.ts';
 import { ensureAccountFresh, needsRefresh, startBackgroundTokenRefresh } from './tokenRefresh.ts';
 
 export {
@@ -190,6 +191,13 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       if (p.profileCookies && !existing.profileCookies) {
         existing.profileCookies = p.profileCookies;
       }
+      // Carry over proxy binding from persisted data
+      if (p.proxyUrl) {
+        existing.proxyUrl = p.proxyUrl;
+      }
+      if (p.proxyFailed !== undefined) {
+        existing.proxyFailed = p.proxyFailed;
+      }
     } else if (p.password || p.token) {
       merged.push(p);
     }
@@ -228,6 +236,8 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       totalRequests: 0,
       profileCookies: a.profileCookies,
       disabled: (a as any).disabled ?? false,
+      proxyUrl: a.proxyUrl,
+      proxyFailed: a.proxyFailed,
       startupStatus: hasPersistedToken && (a.expiresAt || 0) > Date.now() ? 'ready' : 'initializing',
     });
   }
@@ -293,6 +303,17 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
     startBackgroundTokenRefresh();
 
     setupAccountWatcherImpl();
+
+    // Fire-and-forget proxy probe: validates every account's sticky proxy,
+    // marks failures for rebind on next request. Non-blocking — the gateway
+    // is already accepting traffic at this point.
+    const probeEmails = accounts.filter((a) => a.state?.token).map((a) => a.email);
+    if (probeEmails.length > 0 && process.env.QWEN_CHAT_PROXY) {
+      probeAllAccounts(probeEmails).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logStore.log('warn', 'proxy', `Startup proxy probe failed: ${msg}`);
+      });
+    }
 
     initDone = true;
   } catch (err) {

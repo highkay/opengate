@@ -31,6 +31,7 @@ import { mergeCookieHeaders } from './browserRuntime.ts';
 import { extractBxUmidtoken } from './bxTokenExtractor.ts';
 import { generateBxPp, generateBxUa, refreshCookiesViaBrowser } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
+import { getAccountProxy, markProxyFailed } from './proxyManager.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 import { tokenCache } from './tokenCache.ts';
 import { disposeWreqWorker, wreqFetch } from './wreqFetch.ts';
@@ -94,9 +95,10 @@ async function transportFetch(
 }
 
 /** Ensure bx-umidtoken is in headers, fetching from cache or sg-wum endpoint. */
-async function ensureBxUmidtoken(headers: Record<string, string>, proxy?: string): Promise<void> {
+async function ensureBxUmidtoken(headers: Record<string, string>, proxy?: string, accountEmail?: string): Promise<void> {
   if (headers['bx-umidtoken']) return;
-  const token = await tokenCache.getOrSet('bx-umidtoken', () => extractBxUmidtoken(proxy), BX_UMIDTOKEN_TTL_MS);
+  const cacheKey = accountEmail ? `bx-umidtoken:${accountEmail}` : 'bx-umidtoken';
+  const token = await tokenCache.getOrSet(cacheKey, () => extractBxUmidtoken(proxy), BX_UMIDTOKEN_TTL_MS);
   headers['bx-umidtoken'] = token;
 }
 
@@ -274,16 +276,18 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     return globalThis.fetch(url, { method, headers, body });
   }
 
-  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true, proxy = defaultBusinessProxy() } = options;
+  const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true } = options;
+  const proxy = options.proxy ?? (accountEmail ? getAccountProxy(accountEmail) : defaultBusinessProxy());
 
   // Auto-inject bx tokens
-  await ensureBxUmidtoken(headers, proxy);
+  await ensureBxUmidtoken(headers, proxy, accountEmail);
 
   if (!headers['bx-v']) headers['bx-v'] = '2.5.36';
   if (!headers['bx-et']) headers['bx-et'] = 'nosgn';
 
   if (!headers['bx-ua']) {
-    const cached = tokenCache.get('bx-ua');
+    const uaCacheKey = accountEmail ? `bx-ua:${accountEmail}` : 'bx-ua';
+    const cached = tokenCache.get(uaCacheKey);
     if (cached) {
       headers['bx-ua'] = cached;
     } else {
@@ -291,7 +295,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         const generated = await generateBxUa();
         if (generated) {
           headers['bx-ua'] = generated;
-          tokenCache.set('bx-ua', generated, BX_UA_TTL_MS);
+          tokenCache.set(uaCacheKey, generated, BX_UA_TTL_MS);
         }
       } catch {
         /* fallback */
@@ -369,6 +373,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         // Fail fast so the auth loop backs off and the IP can cool down.
         // Playwright recovery stays for the legacy wreq transport only.
         if (isNativeTransport()) {
+          if (accountEmail) markProxyFailed(accountEmail);
           throw new Error(
             `Aliyun WAF challenge persists after HTTP cookie refresh for ${url.split('?')[0]}; skipping browser recovery (native transport) — IP needs cooldown`,
           );
@@ -385,10 +390,9 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         const freshCookies = await promise;
         if (freshCookies) {
           headers['cookie'] = mergeCookieHeaders(currentCookie, headers['cookie'], freshCookies);
-          tokenCache.delete('bx-ua');
-          tokenCache.delete('bx-pp');
+          tokenCache.delete(accountEmail ? `bx-ua:${accountEmail}` : 'bx-ua');
           tokenCache.delete(acwTcCacheKey(proxy));
-          await ensureBxUmidtoken(headers, proxy);
+          await ensureBxUmidtoken(headers, proxy, accountEmail);
           headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
           const pp = await generateBxPp(body);
           if (pp) headers['bx-pp'] = pp;
@@ -408,6 +412,9 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
           const after = await wafCheckResponse(response, !!stream);
           response = after.response;
           if (after.waf) {
+            // WAF persists after full recovery — mark proxy as failed so next
+            // request gets a fresh proxy (new sticky session → new exit IP).
+            if (accountEmail) markProxyFailed(accountEmail);
             throw new Error(`WAF challenge persists after cookie refresh for ${url.split('?')[0]}`);
           }
         }
@@ -444,7 +451,13 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     logStore.log('warn', 'browserless', `${method} ${url.split('?')[0]} failed after ${elapsed}ms: ${msg}`);
 
     if (msg.includes('403') || msg.includes('FAIL_SYS_USER_VALIDATE')) {
-      tokenCache.delete('bx-umidtoken');
+      tokenCache.delete(accountEmail ? `bx-umidtoken:${accountEmail}` : 'bx-umidtoken');
+    }
+
+    // Network-level failure (proxy down, tunnel error, EOF, timeout) — the proxy
+    // is degraded; mark it so the next request rebinds to a fresh sticky IP.
+    if (accountEmail && !errStr.includes('waf') && !errStr.includes('aliyun_waf') && !errStr.includes('302')) {
+      markProxyFailed(accountEmail);
     }
 
     throw err;

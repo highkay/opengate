@@ -87,6 +87,8 @@ interface PersistedAccountData {
   profileCookies?: string;
   throttledUntil?: number;
   disabled?: boolean;
+  proxyUrl?: string;
+  proxyFailed?: boolean;
 }
 export interface LoadedAccountData {
   email: string;
@@ -97,6 +99,8 @@ export interface LoadedAccountData {
   refreshToken?: string | null;
   expiresAt?: number;
   profileCookies?: string;
+  proxyUrl?: string;
+  proxyFailed?: boolean;
 }
 export function parseAccountsFromEnv(): Array<{ email: string; password: string }> {
   const result: Array<{ email: string; password: string }> = [];
@@ -267,6 +271,8 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
       ...(a.profileCookies ? { profileCookies: a.profileCookies } : {}),
       ...(a.throttledUntil > Date.now() ? { throttledUntil: a.throttledUntil } : {}),
       ...(a.disabled !== undefined ? { disabled: a.disabled } : {}),
+      ...(a.proxyUrl ? { proxyUrl: a.proxyUrl } : {}),
+      ...(a.proxyFailed !== undefined ? { proxyFailed: a.proxyFailed } : {}),
     }));
   writeAccountsAtomically(getAccountsFile(), data);
 }
@@ -296,6 +302,8 @@ export function loadAccountsFromFile(): LoadedAccountData[] {
           refreshToken: d.refreshToken ?? d.refresh_token ?? null,
           expiresAt: tokenExpiresAt(d),
           profileCookies: d.profileCookies || d.cookies,
+          proxyUrl: d.proxyUrl,
+          proxyFailed: d.proxyFailed,
         }));
       if (needsPasswordMigration) {
         const migrated = data.map((account) => ({
@@ -470,6 +478,8 @@ export async function reloadAccounts(): Promise<void> {
         totalRequests: 0,
         profileCookies: desired.profileCookies,
         disabled: desired.disabled ?? false,
+        proxyUrl: desired.proxyUrl,
+        proxyFailed: desired.proxyFailed,
         startupStatus: desired.token && (desired.expiresAt || 0) > Date.now() ? 'ready' : 'pending',
       };
       accounts.push(entry);
@@ -482,6 +492,8 @@ export async function reloadAccounts(): Promise<void> {
     existing.password = desired.password;
     existing.disabled = desired.disabled ?? false;
     existing.profileCookies = desired.profileCookies;
+    existing.proxyUrl = desired.proxyUrl;
+    existing.proxyFailed = desired.proxyFailed;
     existing.throttledUntil = desired.throttledUntil && desired.throttledUntil > Date.now() ? desired.throttledUntil : 0;
     if (desired.token) {
       existing.state = {
