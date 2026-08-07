@@ -100,6 +100,36 @@ describe('authentication lifecycle persistence', () => {
     assert.equal(decrypt(persisted.password), 'rotation-secret');
   });
 
+  test('loads accounts with http(s) proxyUrl without manging the JSON', () => {
+    const proxyUrl = 'http://Default.tmpacct1:highkay1844@192.168.1.18:2260';
+    writeFileSync(
+      join(dataDir, 'accounts.json'),
+      JSON.stringify(
+        [{ email: 'tmpacct1@qwen.gate', password: 'secret', token: 't', proxyUrl, proxyEpoch: 2 }],
+        null,
+        2,
+      ),
+      'utf-8',
+    );
+
+    const loaded = loadAccountsFromFile();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0]?.proxyUrl, proxyUrl);
+    assert.equal(loaded[0]?.proxyEpoch, 2);
+  });
+
+  test('loads a JSONC config that includes real line comments', () => {
+    writeFileSync(
+      join(dataDir, 'accounts.json'),
+      '[\n  // a real comment line\n  { "email": "c@example.com", "password": "pw:aa:bb", "token": "t" }\n]\n',
+      'utf-8',
+    );
+
+    const loaded = loadAccountsFromFile();
+    assert.equal(loaded.length, 1);
+    assert.equal(loaded[0]?.email, 'c@example.com');
+  });
+
   test('loadAccountsFromFile migrates legacy plaintext passwords', () => {
     writeFileSync(
       join(dataDir, 'accounts.json'),

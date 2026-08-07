@@ -70,9 +70,13 @@ export interface CookieData {
   savedAt: number;
   expiresAt: number;
 }
-/** Strip // and /* * / JSONC comments before JSON.parse */
+/**
+ * Strip JSONC comments (// and /* * /) before JSON.parse.
+ * Only `//` preceded by line-start or whitespace is treated as a comment so
+ * URLs like "http://..." inside string values survive untouched.
+ */
 function stripJsoncComments(text: string): string {
-  return text.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+  return text.replace(/(^|\s)\/\/[^\n]*/gm, '$1').replace(/\/\*[\s\S]*?\*\//g, '');
 }
 
 interface PersistedAccountData {
