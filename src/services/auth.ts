@@ -198,6 +198,9 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       if (p.proxyFailed !== undefined) {
         existing.proxyFailed = p.proxyFailed;
       }
+      if (p.proxyEpoch !== undefined) {
+        existing.proxyEpoch = p.proxyEpoch;
+      }
     } else if (p.password || p.token) {
       merged.push(p);
     }
@@ -238,6 +241,7 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
       disabled: (a as any).disabled ?? false,
       proxyUrl: a.proxyUrl,
       proxyFailed: a.proxyFailed,
+      proxyEpoch: a.proxyEpoch,
       startupStatus: hasPersistedToken && (a.expiresAt || 0) > Date.now() ? 'ready' : 'initializing',
     });
   }

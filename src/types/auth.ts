@@ -38,4 +38,11 @@ export interface AccountEntry {
    * must be rebuilt (new session → new exit IP) before the next request.
    */
   proxyFailed?: boolean;
+  /**
+   * Rebinding epoch. Incremented on each markProxyFailed. The current value is
+   * appended to the proxy session suffix so a rebind yields a NEW session ID
+   * (and therefore a new exit IP) instead of reusing the same one. Persisted
+   * so the suffix stays stable across restarts (IP stickiness retained).
+   */
+  proxyEpoch?: number;
 }

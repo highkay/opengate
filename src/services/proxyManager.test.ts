@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, test } from 'node:test';
 
 import type { AccountEntry } from '../types/auth.ts';
 import { accounts, rebuildEmailIndex } from './accountManager.ts';
-import { buildAccountProxy, getAccountProxy, markProxyFailed, sanitizeEmail } from './proxyManager.ts';
+import { buildAccountProxy, getAccountProxy, markProxyFailed, proxyEpochOf, sanitizeEmail } from './proxyManager.ts';
 
 function account(email: string): AccountEntry {
   return {
@@ -56,6 +56,17 @@ describe('proxyManager', () => {
     assert.equal(proxy, 'http://Default.tmpacct1:highkay1844@192.168.1.18:2260');
   });
 
+  test('buildAccountProxy appends epoch suffix when epoch > 0', () => {
+    const proxy = buildAccountProxy('tmpacct1@highkay.qzz.io', 3);
+    assert.equal(proxy, 'http://Default.tmpacct1-e3:highkay1844@192.168.1.18:2260');
+    assert.equal(proxyEpochOf(proxy), 3);
+  });
+
+  test('proxyEpochOf parses epoch suffix', () => {
+    assert.equal(proxyEpochOf('http://Default.tmpacct1-e7:pass@h:1'), 7);
+    assert.equal(proxyEpochOf('http://Default.tmpacct1:pass@h:1'), 0);
+  });
+
   test('buildAccountProxy returns null when no proxy env is configured', () => {
     delete process.env.QWEN_CHAT_PROXY;
     delete process.env.QWEN_PROXY;
@@ -77,21 +88,40 @@ describe('proxyManager', () => {
     assert.equal(acct.proxyFailed, false);
   });
 
-  test('markProxyFailed forces a fresh proxy URL on the next call', () => {
+  test('markProxyFailed rebinds to a DIFFERENT session suffix (new IP)', () => {
     const acct = account('tmpacct1@highkay.qzz.io');
     accounts.push(acct);
     rebuildEmailIndex();
 
     const first = getAccountProxy(acct.email);
+    assert.equal(first, 'http://Default.tmpacct1:highkay1844@192.168.1.18:2260');
+    assert.equal(acct.proxyEpoch, 0);
+
     markProxyFailed(acct.email);
     assert.equal(acct.proxyFailed, true);
+    assert.equal(acct.proxyEpoch, 1);
 
-    // Same email → same sanitized segment → same sticky session id → same URL.
-    // The rebind is a fresh session only when the account segment changes;
-    // markProxyFailed clears the binding so the next build creates a new session.
+    // Rebind must yield a DIFFERENT session suffix → different exit IP
     const second = getAccountProxy(acct.email);
-    assert.equal(second, 'http://Default.tmpacct1:highkay1844@192.168.1.18:2260');
+    assert.equal(second, 'http://Default.tmpacct1-e1:highkay1844@192.168.1.18:2260');
+    assert.notEqual(second, first);
     assert.equal(acct.proxyFailed, false);
+    assert.equal(acct.proxyEpoch, 1);
+  });
+
+  test('multiple failures keep bumping the epoch', () => {
+    const acct = account('tmpacct1@highkay.qzz.io');
+    accounts.push(acct);
+    rebuildEmailIndex();
+
+    getAccountProxy(acct.email); // epoch 0
+    markProxyFailed(acct.email); // epoch 1
+    getAccountProxy(acct.email); // -e1
+    markProxyFailed(acct.email); // epoch 2
+    const third = getAccountProxy(acct.email);
+
+    assert.equal(third, 'http://Default.tmpacct1-e2:highkay1844@192.168.1.18:2260');
+    assert.equal(acct.proxyEpoch, 2);
   });
 
   test('getAccountProxy falls back to default when no account is registered', () => {

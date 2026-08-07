@@ -40,13 +40,27 @@ export function sanitizeEmail(email: string): string {
 
 /**
  * Build a sticky proxy URL for a specific account.
- * http://Default.{sanitized}:password@host:port
+ *
+ * epoch=0: http://Default.{sanitized}:password@host:port
+ * epoch>0: http://Default.{sanitized}-e{epoch}:password@host:port
+ *
+ * The epoch suffix is the "session" the proxy provider keys stickiness on:
+ * same suffix → same exit IP for the session lifetime; a different suffix →
+ * a brand-new IP assignment. Rebinding after a failure therefore bumps the
+ * epoch so the account gets a fresh IP instead of the degraded one.
  */
-export function buildAccountProxy(email: string): string | null {
+export function buildAccountProxy(email: string, epoch = 0): string | null {
   const parsed = parseBaseProxy();
   if (!parsed) return null;
   const safe = sanitizeEmail(email);
-  return `${parsed.protocol}Default.${safe}:${parsed.password}@${parsed.hostport}`;
+  const session = epoch > 0 ? `${safe}-e${epoch}` : safe;
+  return `${parsed.protocol}Default.${session}:${parsed.password}@${parsed.hostport}`;
+}
+
+/** Extract the epoch suffix from a proxy URL (for diagnostics/tests). */
+export function proxyEpochOf(url: string): number {
+  const match = url.match(/-e(\d+):/);
+  return match ? Number(match[1]) : 0;
 }
 
 // ─── Account proxy binding ──────────────────────────────────────────────────
@@ -55,7 +69,7 @@ export function buildAccountProxy(email: string): string | null {
  * Resolve the proxy URL for an account.
  *
  * - If the account has a `proxyUrl` and it has NOT been marked failed → reuse it.
- * - Otherwise → build a fresh URL (new session ID → new sticky IP).
+ * - Otherwise → rebind: bump epoch, build a fresh URL (new session → new IP).
  * - Falls back to defaultBusinessProxy() when no template proxy is configured.
  */
 export function getAccountProxy(email: string): string | undefined {
@@ -65,10 +79,12 @@ export function getAccountProxy(email: string): string | undefined {
     return acct.proxyUrl;
   }
 
-  const newProxy = buildAccountProxy(email);
+  const epoch = acct?.proxyEpoch ?? 0;
+  const newProxy = buildAccountProxy(email, epoch);
   if (newProxy && acct) {
     acct.proxyUrl = newProxy;
     acct.proxyFailed = false;
+    acct.proxyEpoch = epoch;
     // Persist asynchronously — not on hot path
     queueMicrotask(() => {
       try {
@@ -83,14 +99,16 @@ export function getAccountProxy(email: string): string | undefined {
 
 /**
  * Mark an account's current proxy as failed.
- * The next call to getAccountProxy() will build a fresh URL (new IP).
+ * Bumps the epoch so the next getAccountProxy() rebinds to a NEW session
+ * (different suffix → different exit IP), breaking the failure loop.
  */
 export function markProxyFailed(email: string): void {
   const acct = getAccountByEmail(email);
   if (!acct) return;
   acct.proxyFailed = true;
   acct.proxyUrl = undefined;
-  logStore.log('warn', 'proxy', `Proxy marked FAILED for ${sanitizeEmail(email)} — will rebind on next request`);
+  acct.proxyEpoch = (acct.proxyEpoch ?? 0) + 1;
+  logStore.log('warn', 'proxy', `Proxy marked FAILED for ${sanitizeEmail(email)} — epoch=${acct.proxyEpoch}, will rebind to a new IP`);
 }
 
 /**
