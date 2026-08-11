@@ -94,6 +94,10 @@ export async function ensureAccountFresh(acct: AccountEntry, loginOptions: Login
 }
 
 const BACKGROUND_REFRESH_INTERVAL_MS = 2 * 60 * 1000;
+// Hard per-account cap inside a tick. A single account whose login path hangs
+// (e.g. an un-timed-out upstream fetch) must never starve every account after
+// it in the list for hours — the loop always advances past a stuck account.
+const REFRESH_PER_ACCOUNT_CAP_MS = 90 * 1000;
 let backgroundRefreshStarted = false;
 
 export function startBackgroundTokenRefresh(): void {
@@ -109,7 +113,15 @@ export function startBackgroundTokenRefresh(): void {
 
       logStore.log('info', 'auth', `Background refresh: token expiring for ${acct.email}, refreshing...`);
       try {
-        const ok = await ensureAccountFresh(acct);
+        const ok = await Promise.race([
+          ensureAccountFresh(acct),
+          new Promise<boolean>((resolve) =>
+            setTimeout(() => {
+              logStore.log('warn', 'auth', `Background refresh slow for ${acct.email} — continuing to next account`);
+              resolve(false);
+            }, REFRESH_PER_ACCOUNT_CAP_MS),
+          ),
+        ]);
         if (ok) {
           logStore.log('info', 'auth', `Background refresh: token renewed for ${acct.email}`);
         } else {

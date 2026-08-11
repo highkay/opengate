@@ -9,6 +9,9 @@
  */
 
 const WUM_URL = 'https://sg-wum.alibaba.com/w/wu.json';
+// Callers pass no abort signal; a stalled proxy tunnel would hang this fetch
+// forever and starve every account behind it in the background refresh loop.
+const WUM_FETCH_TIMEOUT_MS = 15_000;
 
 /**
  * Extract bx-umidtoken from the sg-wum.alibaba.com endpoint.
@@ -21,23 +24,29 @@ export async function extractBxUmidtoken(proxy?: string): Promise<string> {
     'cache-control': 'no-cache',
     pragma: 'no-cache',
   };
-  const fetchInit: RequestInit = { method: 'GET', headers };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('bx-umidtoken fetch timed out')), WUM_FETCH_TIMEOUT_MS);
+  const fetchInit: RequestInit = { method: 'GET', headers, signal: controller.signal };
   // Bun native fetch supports http(s) proxies only; socks5 falls back to direct.
   if (proxy && /^https?:\/\//i.test(proxy)) (fetchInit as any).proxy = proxy;
 
-  const response = await globalThis.fetch(WUM_URL, fetchInit);
+  try {
+    const response = await globalThis.fetch(WUM_URL, fetchInit);
 
-  if (!response.ok) {
-    throw new Error(`bx-umidtoken extraction failed: ${response.status} ${response.statusText}`);
+    if (!response.ok) {
+      throw new Error(`bx-umidtoken extraction failed: ${response.status} ${response.statusText}`);
+    }
+
+    const text = await response.text();
+
+    // Match: umx.wu('BASE64_TOKEN') or __fycb('BASE64_TOKEN')
+    const match = text.match(/(?:umx\.wu|__fycb)\('([^']+)'\)/);
+    if (!match) {
+      throw new Error(`bx-umidtoken extraction failed: unexpected response format: ${text.slice(0, 100)}`);
+    }
+
+    return match[1];
+  } finally {
+    clearTimeout(timer);
   }
-
-  const text = await response.text();
-
-  // Match: umx.wu('BASE64_TOKEN') or __fycb('BASE64_TOKEN')
-  const match = text.match(/(?:umx\.wu|__fycb)\('([^']+)'\)/);
-  if (!match) {
-    throw new Error(`bx-umidtoken extraction failed: unexpected response format: ${text.slice(0, 100)}`);
-  }
-
-  return match[1];
 }

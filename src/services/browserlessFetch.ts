@@ -130,26 +130,33 @@ function refreshAcwTcCookie(proxy?: string): Promise<string | null> {
 async function doRefreshAcwTcCookie(proxy?: string): Promise<string | null> {
   try {
     logEvent('refreshAcwTcCookie', 'fetching acw_tc from root');
-    const resp = await nativeFetch(QWEN_API_BASE, {
-      method: 'GET',
-      headers: { accept: 'text/html,application/xhtml+xml' },
-      proxy,
-    });
-    logFetchCall('refreshAcwTcCookie', QWEN_API_BASE, 'GET', resp.status);
-    let acwTc: string | null = null;
-    const setCookie = resp.headers.get('set-cookie');
-    if (setCookie && setCookie.includes('acw_tc=')) {
-      const match = setCookie.match(/acw_tc=([^;]+)/);
-      if (match) acwTc = match[1];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('acw_tc refresh timed out')), 15_000);
+    try {
+      const resp = await nativeFetch(QWEN_API_BASE, {
+        method: 'GET',
+        headers: { accept: 'text/html,application/xhtml+xml' },
+        signal: controller.signal,
+        proxy,
+      });
+      logFetchCall('refreshAcwTcCookie', QWEN_API_BASE, 'GET', resp.status);
+      let acwTc: string | null = null;
+      const setCookie = resp.headers.get('set-cookie');
+      if (setCookie && setCookie.includes('acw_tc=')) {
+        const match = setCookie.match(/acw_tc=([^;]+)/);
+        if (match) acwTc = match[1];
+      }
+      if (acwTc) {
+        tokenCache.set(acwTcCacheKey(proxy), acwTc, ACW_TC_REFRESH_MS * 2);
+        logStore.log('debug', 'browserless', 'acw_tc cookie refreshed');
+        logEvent('refreshAcwTcCookie', 'acw_tc obtained');
+      } else {
+        logEvent('refreshAcwTcCookie', 'no acw_tc in response');
+      }
+      return acwTc;
+    } finally {
+      clearTimeout(timer);
     }
-    if (acwTc) {
-      tokenCache.set(acwTcCacheKey(proxy), acwTc, ACW_TC_REFRESH_MS * 2);
-      logStore.log('debug', 'browserless', 'acw_tc cookie refreshed');
-      logEvent('refreshAcwTcCookie', 'acw_tc obtained');
-    } else {
-      logEvent('refreshAcwTcCookie', 'no acw_tc in response');
-    }
-    return acwTc;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logStore.log('warn', 'browserless', `acw_tc refresh failed: ${msg}`);
