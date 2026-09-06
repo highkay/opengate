@@ -104,11 +104,7 @@ describe('authentication lifecycle persistence', () => {
     const proxyUrl = 'http://Default.tmpacct1:highkay1844@192.168.1.18:2260';
     writeFileSync(
       join(dataDir, 'accounts.json'),
-      JSON.stringify(
-        [{ email: 'tmpacct1@qwen.gate', password: 'secret', token: 't', proxyUrl, proxyEpoch: 2 }],
-        null,
-        2,
-      ),
+      JSON.stringify([{ email: 'tmpacct1@qwen.gate', password: 'secret', token: 't', proxyUrl, proxyEpoch: 2 }], null, 2),
       'utf-8',
     );
 
