@@ -244,3 +244,38 @@ export async function probeAllAccounts(accountEmails: readonly string[]): Promis
   const okCount = results.filter((r) => r.result.ok).length;
   logStore.log('info', 'proxy', `Proxy probe: ${okCount}/${results.length} accounts OK`);
 }
+
+let probeWaveRunning = false;
+
+/**
+ * Re-run the probe wave on an interval — the startup probe is one-shot, but
+ * this pool's node half-life is ~15-20 min and pickAccount prefers non-flagged
+ * binds, so traffic alone will NOT heal flagged accounts. Each periodic wave
+ * redraws flagged binds via getAccountProxy, validates them, clears the flag
+ * and re-primes bx-umidtoken — all without spending a user request. Skips the
+ * tick when the previous wave is still running (a 24-account wave takes
+ * minutes at the probe concurrency limit).
+ */
+export function startPeriodicProxyProbe(getEmails: () => readonly string[], intervalMs = 10 * 60 * 1000): void {
+  const timer = setInterval(() => {
+    void (async () => {
+      if (probeWaveRunning) {
+        logStore.log('debug', 'proxy', 'Periodic proxy probe skipped — previous wave still running');
+        return;
+      }
+      probeWaveRunning = true;
+      try {
+        const emails = getEmails();
+        if (emails.length > 0 && process.env.QWEN_CHAT_PROXY) {
+          await probeAllAccounts(emails);
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logStore.log('warn', 'proxy', `Periodic proxy probe failed: ${msg}`);
+      } finally {
+        probeWaveRunning = false;
+      }
+    })();
+  }, intervalMs);
+  timer.unref?.();
+}

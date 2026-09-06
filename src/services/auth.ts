@@ -26,7 +26,7 @@ import { config } from './configService.ts';
 import { loginFresh } from './loginService.ts';
 import { logStore } from './logStore.ts';
 import { getActivePage } from './playwright.ts';
-import { probeAllAccounts } from './proxyManager.ts';
+import { probeAllAccounts, startPeriodicProxyProbe } from './proxyManager.ts';
 import { ensureAccountFresh, needsRefresh, startBackgroundTokenRefresh } from './tokenRefresh.ts';
 
 export {
@@ -317,6 +317,11 @@ export async function initAuth(onAccountReady?: (email: string) => Promise<void>
         const msg = err instanceof Error ? err.message : String(err);
         logStore.log('warn', 'proxy', `Startup proxy probe failed: ${msg}`);
       });
+      // Periodic re-probe: binds die on a 15-20 min half-life in this pool,
+      // and pickAccount prefers non-flagged binds, so traffic alone cannot
+      // heal flagged accounts. Each wave redraws flagged binds, validates
+      // them, clears the flag and re-primes umidtoken in the background.
+      startPeriodicProxyProbe(() => accounts.filter((a) => a.state?.token).map((a) => a.email));
     }
 
     initDone = true;
