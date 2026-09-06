@@ -13,6 +13,7 @@
  */
 
 import { accounts, getAccountByEmail, saveAccountsToFile } from './accountManager.ts';
+import { BX_UMIDTOKEN_TTL_MS, extractBxUmidtoken } from './bxTokenExtractor.ts';
 import { logStore } from './logStore.ts';
 import { tokenCache } from './tokenCache.ts';
 
@@ -202,7 +203,7 @@ export async function probeProxy(proxyUrl: string): Promise<ProbeResult> {
  * Accounts whose probes fail get markProxyFailed() so they rebind on first use.
  */
 export async function probeAllAccounts(accountEmails: readonly string[]): Promise<void> {
-  const results: Array<{ email: string; result: ProbeResult }> = [];
+  const results: Array<{ email: string; proxyUrl?: string; result: ProbeResult }> = [];
 
   // Throttled parallel probe
   const chunks: string[][] = [];
@@ -213,19 +214,29 @@ export async function probeAllAccounts(accountEmails: readonly string[]): Promis
   for (const chunk of chunks) {
     const probes = chunk.map(async (email) => {
       const proxy = getAccountProxy(email);
-      if (!proxy) return { email, result: { ok: false, ip: '', acwTc: false, error: 'no proxy configured' } };
+      if (!proxy) return { email, proxyUrl: undefined, result: { ok: false, ip: '', acwTc: false, error: 'no proxy configured' } };
       const result = await probeProxy(proxy);
-      return { email, result };
+      return { email, proxyUrl: proxy, result };
     });
     const chunkResults = await Promise.all(probes);
     results.push(...chunkResults);
   }
 
   // Process results
-  for (const { email, result } of results) {
+  for (const { email, proxyUrl, result } of results) {
     if (!result.ok) {
       markProxyFailed(email);
       logStore.log('warn', 'proxy', `Account ${sanitizeEmail(email)}: proxy probe FAILED, will rebind on next use`);
+      continue;
+    }
+    // Prime the per-account bx-umidtoken cache over the healthy bind during
+    // startup so the first real chat request never stalls on a 15s WUM fetch
+    // through a bind that may have flipped since the probe. A priming failure
+    // is benign: on-demand extraction (with its own timeout) still works.
+    try {
+      await tokenCache.getOrSet(`bx-umidtoken:${email}`, () => extractBxUmidtoken(proxyUrl), BX_UMIDTOKEN_TTL_MS);
+    } catch {
+      /* probe already validated the bind; on-demand extraction remains */
     }
   }
 

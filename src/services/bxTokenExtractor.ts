@@ -13,6 +13,9 @@ const WUM_URL = 'https://sg-wum.alibaba.com/w/wu.json';
 // forever and starve every account behind it in the background refresh loop.
 const WUM_FETCH_TIMEOUT_MS = 15_000;
 
+/** bx-umidtoken is a long-lived device ID (hours-days); cache keyed per account. */
+export const BX_UMIDTOKEN_TTL_MS = 4 * 60 * 60 * 1000;
+
 /**
  * Extract bx-umidtoken from the sg-wum.alibaba.com endpoint.
  * Cached via tokenCache with 4h TTL — callers should not cache on top of this.

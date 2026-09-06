@@ -28,7 +28,7 @@
 
 import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
 import { mergeCookieHeaders } from './browserRuntime.ts';
-import { extractBxUmidtoken } from './bxTokenExtractor.ts';
+import { BX_UMIDTOKEN_TTL_MS, extractBxUmidtoken } from './bxTokenExtractor.ts';
 import { generateBxPp, generateBxUa, refreshCookiesViaBrowser } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
 import { getAccountProxy, markProxyFailed } from './proxyManager.ts';
@@ -38,7 +38,6 @@ import { disposeWreqWorker, wreqFetch } from './wreqFetch.ts';
 
 // Single-flight guard: one cookie refresh per account at a time
 const cookieRefreshInFlight = new Map<string, Promise<string | null>>();
-const BX_UMIDTOKEN_TTL_MS = 4 * 60 * 60 * 1000;
 const BX_UA_TTL_MS = 15 * 60 * 1000;
 const ACW_TC_REFRESH_MS = 15 * 60 * 1000; // 15 minutes
 
