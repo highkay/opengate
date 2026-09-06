@@ -229,6 +229,7 @@ export async function probeAllAccounts(accountEmails: readonly string[]): Promis
       logStore.log('warn', 'proxy', `Account ${sanitizeEmail(email)}: proxy probe FAILED, will rebind on next use`);
       continue;
     }
+    clearProxyFailed(email);
     // Prime the per-account bx-umidtoken cache over the healthy bind during
     // startup so the first real chat request never stalls on a 15s WUM fetch
     // through a bind that may have flipped since the probe. A priming failure

@@ -617,7 +617,11 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
     }
     const pool = available.filter((a) => a.inFlight === 0);
     const candidates = [...(pool.length > 0 ? pool : available)].sort(
-      (a, b) => a.inFlight - b.inFlight || a.totalRequests - b.totalRequests || (a.lastUsed || 0) - (b.lastUsed || 0),
+      (a, b) =>
+        Number(a.proxyFailed ?? false) - Number(b.proxyFailed ?? false) ||
+        a.inFlight - b.inFlight ||
+        a.totalRequests - b.totalRequests ||
+        (a.lastUsed || 0) - (b.lastUsed || 0),
     );
     const { ensureAccountFresh } = await import('./tokenRefresh.ts');
     let picked: AccountEntry | null = null;
