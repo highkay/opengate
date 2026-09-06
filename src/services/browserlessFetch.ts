@@ -111,22 +111,28 @@ function acwTcCacheKey(proxy?: string): string {
 }
 
 let acwTcRefreshTimer: ReturnType<typeof setInterval> | null = null;
-let acwTcRefreshInFlight: Promise<string | null> | null = null;
+/** Per-proxy-path single-flight: acw_tc is bound to the exit IP, so a cookie
+ * minted on account A's proxy must NEVER be handed to account B's refresh or
+ * injected into B's requests (cross-IP cookie = pointless + extra punishment). */
+const acwTcRefreshInFlight = new Map<string, Promise<string | null>>();
 
 /**
  * Fetch acw_tc cookie from the Qwen root page via native fetch.
- * Single-flight: concurrent callers (immediate ensure + preload timer) share one
- * root request — back-to-back root GETs just before an API POST were observed to
- * trip the WAF into resetting the connection (ECONNRESET on signin).
+ * Single-flight keyed by proxy path: concurrent callers (immediate ensure +
+ * preload timer) on the SAME path share one root request — back-to-back root
+ * GETs just before an API POST were observed to trip the WAF into resetting
+ * the connection (ECONNRESET on signin).
  */
 function refreshAcwTcCookie(proxy?: string): Promise<string | null> {
-  if (acwTcRefreshInFlight) return acwTcRefreshInFlight;
-  acwTcRefreshInFlight = doRefreshAcwTcCookie(proxy).finally(() => {
-    acwTcRefreshInFlight = null;
+  const key = acwTcCacheKey(proxy);
+  const existing = acwTcRefreshInFlight.get(key);
+  if (existing) return existing;
+  const flight = doRefreshAcwTcCookie(proxy).finally(() => {
+    acwTcRefreshInFlight.delete(key);
   });
-  return acwTcRefreshInFlight;
+  acwTcRefreshInFlight.set(key, flight);
+  return flight;
 }
-
 async function doRefreshAcwTcCookie(proxy?: string): Promise<string | null> {
   try {
     logEvent('refreshAcwTcCookie', 'fetching acw_tc from root');
@@ -286,8 +292,8 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
   const { method = 'GET', headers = {}, body, accountEmail, signal, stream, allowBrowserRecovery = true } = options;
   const proxy = options.proxy ?? (accountEmail ? getAccountProxy(accountEmail) : defaultBusinessProxy());
 
-  // Auto-inject bx tokens
-  await ensureBxUmidtoken(headers, proxy, accountEmail);
+  // Auto-inject bx tokens (pure header builders — network-dependent token
+  // fetches run inside the guarded try below, see the note there)
 
   if (!headers['bx-v']) headers['bx-v'] = '2.5.36';
   if (!headers['bx-et']) headers['bx-et'] = 'nosgn';
@@ -322,12 +328,17 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     }
   }
 
-  await ensureAcwTcCookie(headers, proxy);
-
   const startTime = Date.now();
 
   // ─── Initial request ───────────────────────────────────────────────
   try {
+    // Auto-inject network tokens INSIDE the guarded region: a stuck/dead
+    // sticky bind (timeout, refused, EOF) must reach the catch below and
+    // trigger markProxyFailed so the account rebinds to a fresh exit IP —
+    // otherwise the account keeps its dead sticky URL forever (same resin
+    // username → same node).
+    await ensureBxUmidtoken(headers, proxy, accountEmail);
+    await ensureAcwTcCookie(headers, proxy);
     logFetchCall('browserlessFetch', url, method);
     let response = await transportFetch(url, {
       method,
@@ -349,7 +360,14 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       let needsBrowserRefresh = true;
 
       const freshAcwTc = await refreshAcwTcCookie(proxy);
-      if (freshAcwTc) {
+      const sentAcwTc = currentCookie.match(/acw_tc=([^;]+)/)?.[1] ?? null;
+      // Native transport: the refresh reuses the same sticky exit IP, so a
+      // same-IP retry can only pass when the WAF actually re-issued a NEW
+      // cookie. A null/stale cookie means the IP itself is flagged — retrying
+      // just adds traffic that extends the punishment. Fail fast instead;
+      // markProxyFailed in the branch below rebinds to a fresh exit IP.
+      const canRetrySameIp = !isNativeTransport() || (freshAcwTc !== null && freshAcwTc !== sentAcwTc);
+      if (canRetrySameIp && freshAcwTc) {
         headers['cookie'] = mergeCookieHeaders(currentCookie, `acw_tc=${freshAcwTc}`);
         logEvent('browserlessFetch', 'HTTP cookie retry', { url: url.split('?')[0] });
         response = await transportFetch(url, {

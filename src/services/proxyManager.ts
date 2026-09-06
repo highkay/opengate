@@ -21,15 +21,30 @@ const PROBE_CONCURRENCY = 2;
 
 // ─── Proxy template helpers ─────────────────────────────────────────────────
 
+let warnedUnparseableTemplate = false;
+
 /** Parse the base proxy URL into template components. */
 function parseBaseProxy(): { protocol: string; password: string; hostport: string } | null {
   const proxy = process.env.QWEN_CHAT_PROXY || process.env.QWEN_PROXY || process.env.QWEN_LOGIN_PROXY || '';
   if (!proxy) return null;
   const match = proxy.match(/^(https?:\/\/)([^:]+):([^@]+)@(.+)$/);
-  if (!match) return null;
+  if (!match) {
+    // Silent null here is an operation hazard: with an unparseable template
+    // every account's buildAccountProxy returns undefined, markProxyFailed
+    // "rebinds" nowhere, and all traffic funnels through one fallback exit
+    // IP until someone reads the logs. Make the misconfiguration loud, once.
+    if (!warnedUnparseableTemplate) {
+      warnedUnparseableTemplate = true;
+      logStore.log(
+        'error',
+        'proxy',
+        `Proxy template unparseable — expected http(s)://user:pass@host:port, got "${proxy}". Per-account sticky rebinding is DISABLED and every account shares one fallback exit IP.`,
+      );
+    }
+    return null;
+  }
   return { protocol: match[1], password: match[3], hostport: match[4] };
 }
-
 /**
  * Sanitize an email address for use as a proxy username segment.
  * "tmppowpwl7673@highkay.qzz.io" → "tmppowpwl7673"
