@@ -282,6 +282,7 @@ export function saveAccountsToFile(accounts: readonly AccountEntry[]): void {
       ...(a.proxyEpoch !== undefined ? { proxyEpoch: a.proxyEpoch } : {}),
     }));
   writeAccountsAtomically(getAccountsFile(), data);
+  lastAccountSaveTs = Date.now();
 }
 function tokenExpiresAt(account: PersistedAccountData): number | undefined {
   if (typeof account.expiresAt === 'number') return account.expiresAt;
@@ -501,10 +502,13 @@ export async function reloadAccounts(): Promise<void> {
     existing.password = desired.password;
     existing.disabled = desired.disabled ?? false;
     existing.profileCookies = desired.profileCookies;
-    existing.proxyUrl = desired.proxyUrl;
-    existing.proxyFailed = desired.proxyFailed;
-    existing.proxyEpoch = desired.proxyEpoch;
+    // proxyUrl / proxyFailed / proxyEpoch are PROCESS-owned runtime state:
+    // markProxyFailed-probe-rebind cycles mutate them at high frequency, and
+    // the file lags behind by design. Overlaying persisted values here would
+    // erase freshly marked failures on every self-write-triggered reload,
+    // routing traffic straight back onto dead binds.
     existing.throttledUntil = desired.throttledUntil && desired.throttledUntil > Date.now() ? desired.throttledUntil : 0;
+
     if (desired.token) {
       existing.state = {
         token: desired.token,
@@ -537,6 +541,8 @@ let accountWatcher: any = null;
 let reloadDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let watcherReady = false;
 let watcherRetryTimer: ReturnType<typeof setTimeout> | null = null;
+/** Timestamp of the last internal write; watcher events inside this window are self-writes. */
+let lastAccountSaveTs = 0;
 /**
  * Set up fs.watch on .qwen/ directory with 500ms debounce to detect accounts.json changes.
  */
@@ -549,6 +555,12 @@ export function setupAccountWatcher(): void {
   try {
     accountWatcher = watch(qwenDir, (_eventType: string, filename: string | null) => {
       if (!filename || filename !== 'accounts.json') return;
+      // Internal persistence (saveAccountsToFile) writes on nearly every
+      // proxy event. Since reloadAccounts no longer overlays proxy health,
+      // reconciling on self-writes is pure 24-account overhead — skip events
+      // landing inside the self-save window. A genuine external edit after
+      // the window closes still reloads normally.
+      if (Date.now() - lastAccountSaveTs < 1500) return;
       if (reloadDebounceTimer) clearTimeout(reloadDebounceTimer);
       reloadDebounceTimer = setTimeout(() => {
         reloadDebounceTimer = null;
